@@ -17,6 +17,16 @@ void main() {
       client.close();
     });
 
+    test('chacha20-poly1305 works against a ssh server', () async {
+      final client = await getHoneypotClient(
+        algorithms: const SSHAlgorithms(
+          cipher: [SSHCipherType.chacha20poly1305],
+        ),
+      );
+      await client.authenticated;
+      client.close();
+    });
+
     test('onVerifyHostKey is called with OpenSSH-style SHA256 fingerprint',
         () async {
       var verifyCalled = false;
@@ -27,6 +37,7 @@ void main() {
         await SSHSocket.connect('test.rebex.net', 22),
         username: 'demo',
         onPasswordRequest: () => 'password',
+        onUserInfoRequest: (req) => [for (final _ in req.prompts) 'password'],
         onVerifyHostKey: (type, fingerprint) {
           verifyCalled = true;
           hostkeyType = type;

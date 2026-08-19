@@ -8,7 +8,11 @@ import 'package:dartssh2/src/hostkey/hostkey_rsa.dart';
 import 'package:dartssh2/src/kex/kex_dh.dart';
 import 'package:dartssh2/src/kex/kex_nist.dart';
 import 'package:dartssh2/src/kex/kex_x25519.dart';
+import 'package:dartssh2/src/message/msg_debug.dart';
+import 'package:dartssh2/src/message/msg_disconnect.dart';
 import 'package:dartssh2/src/message/msg_userauth.dart';
+import 'package:dartssh2/src/message/msg_ignore.dart';
+import 'package:dartssh2/src/message/msg_unimplemented.dart';
 import 'package:dartssh2/src/ssh_algorithm.dart';
 import 'package:dartssh2/src/ssh_kex.dart';
 import 'package:dartssh2/src/utils/bigint.dart';
@@ -19,6 +23,8 @@ import 'package:dartssh2/src/ssh_packet.dart';
 import 'package:dartssh2/src/utils/int.dart';
 import 'package:dartssh2/src/hostkey/hostkey_ed25519.dart';
 import 'package:dartssh2/src/utils/list.dart';
+import 'package:dartssh2/src/utils/openssh_chacha20_poly1305.dart';
+import 'package:dartssh2/src/message/msg_ext_info.dart';
 import 'package:dartssh2/src/message/msg_kex.dart';
 import 'package:dartssh2/src/message/msg_kex_dh.dart';
 import 'package:dartssh2/src/message/msg_kex_ecdh.dart';
@@ -47,6 +53,25 @@ Uint8List _hostkeyFingerprint(Uint8List hostkey) {
 typedef SSHTransportReadyHandler = void Function();
 
 typedef SSHPacketHandler = void Function(Uint8List payload);
+
+/// Handles a packet and returns whether its message type is recognized.
+typedef SSHMessageHandler = bool Function(Uint8List payload);
+
+/// Pseudo algorithm names that are advertised inside the key exchange
+/// name-list without being key exchange algorithms themselves.
+abstract class SSHKexPseudoAlgorithm {
+  /// Sent by a client to signal support for strict key exchange.
+  static const strictKexClient = 'kex-strict-c-v00@openssh.com';
+
+  /// Sent by a server to signal support for strict key exchange.
+  static const strictKexServer = 'kex-strict-s-v00@openssh.com';
+
+  /// Sent by a client to ask for SSH_MSG_EXT_INFO (RFC 8308 §2.2).
+  static const extInfoClient = 'ext-info-c';
+
+  /// Sent by a server to ask for SSH_MSG_EXT_INFO (RFC 8308 §2.2).
+  static const extInfoServer = 'ext-info-s';
+}
 
 class SSHTransport {
   /// Version of the SSH software. By default "DartSSH_2.0"
@@ -78,7 +103,23 @@ class SSHTransport {
   final SSHTransportReadyHandler? onReady;
 
   /// Function called when a packet is received.
+  ///
+  /// Every packet handed to this callback is assumed to be handled, so the
+  /// transport can never tell that a message was unrecognized and never
+  /// replies with SSH_MSG_UNIMPLEMENTED on its behalf.
+  @Deprecated(
+    'Use onMessage instead, which reports whether the message was recognized '
+    'so the transport can answer unknown ones as RFC 4253 requires. '
+    'Will be removed in a future major release.',
+  )
   final SSHPacketHandler? onPacket;
+
+  /// Function called for messages not handled by the transport layer.
+  ///
+  /// Returning `false` causes the transport to reply with
+  /// SSH_MSG_UNIMPLEMENTED for the current packet. [onPacket] is retained for
+  /// backwards compatibility and assumes every packet it receives is handled.
+  final SSHMessageHandler? onMessage;
 
   /// Whether to bypass server host key verification.
   ///
@@ -108,8 +149,9 @@ class SSHTransport {
     this.onVerifyHostKey,
     this.onReady,
     this.onPacket,
+    this.onMessage,
     this.disableHostkeyVerification = false,
-  }) {
+  }) : assert(onPacket == null || onMessage == null) {
     _initSocket();
     _startHandshake();
   }
@@ -163,11 +205,23 @@ class SSHTransport {
   /// The decryption cipher algorithm type selected for server-to-client communication.
   SSHCipherType? _serverCipherType;
 
+  /// Cipher currently active for packets sent to the other side.
+  SSHCipherType? _localCipherType;
+
+  /// Cipher currently active for packets received from the other side.
+  SSHCipherType? _remoteCipherType;
+
   /// The MAC algorithm type selected for client-to-server integrity verification.
   SSHMacType? _clientMacType;
 
   /// The MAC algorithm type selected for server-to-client integrity verification.
   SSHMacType? _serverMacType;
+
+  /// MAC currently active for packets sent to the other side.
+  SSHMacType? _localMacType;
+
+  /// MAC currently active for packets received from the other side.
+  SSHMacType? _remoteMacType;
 
   /// The active key exchange algorithm implementation instance.
   SSHKex? _kex;
@@ -175,6 +229,10 @@ class SSHTransport {
   /// [_exchangeHash] of the first key exchange is used as session identifier.
   /// Used to derive the cipher IV, cipher key and MAC key.
   Uint8List? _sessionId;
+
+  // ignore: unnecessary_getters_setters
+  Uint8List? get sessionId => _sessionId;
+  set sessionId(Uint8List? value) => _sessionId = value;
 
   /// A hash value of various parameters (defined in rfc4253). Kept to derive the
   /// cipher IV, cipher key and MAC key.
@@ -193,6 +251,12 @@ class SSHTransport {
 
   /// A [BlockCipher] to decrypt data sent from the other side.
   BlockCipher? _decryptCipher;
+
+  /// OpenSSH ChaCha20-Poly1305 context for packets sent to the other side.
+  OpenSSHChaCha20Poly1305? _localChaChaCipher;
+
+  /// OpenSSH ChaCha20-Poly1305 context for packets received from the other side.
+  OpenSSHChaCha20Poly1305? _remoteChaChaCipher;
 
   /// The cipher key derived for encrypting outgoing data.
   Uint8List? _localCipherKey;
@@ -243,6 +307,38 @@ class SSHTransport {
   /// exchange round. This is reset when the exchange finishes.
   bool _sentKexInit = false;
 
+  /// Whether the initial key exchange is still running. The strict key exchange
+  /// and EXT_INFO indicators are only valid in the first SSH_MSG_KEXINIT, so
+  /// they are advertised and read while this is `true`.
+  bool _isFirstKex = true;
+
+  /// Whether both peers advertised strict key exchange and it is therefore in
+  /// effect for this connection.
+  ///
+  /// Strict key exchange is the countermeasure against the Terrapin attack
+  /// (CVE-2023-48795). It removes the attacker's ability to delete packets
+  /// from the start of the connection undetected, by resetting the packet
+  /// sequence numbers after every SSH_MSG_NEWKEYS and by forbidding the
+  /// optional messages that made the injection possible.
+  bool get strictKex => _strictKex;
+  var _strictKex = false;
+
+  /// Set when a received SSH_MSG_NEWKEYS asks for a sequence number reset, so
+  /// that the reset happens after [_processPackets] is done with the packet
+  /// rather than being undone by the trailing increment.
+  var _resetRemotePacketSN = false;
+
+  /// Extensions sent by the server in SSH_MSG_EXT_INFO (RFC 8308), or `null`
+  /// if the server sent none.
+  Map<String, Uint8List>? get extInfo => _extInfo;
+  Map<String, Uint8List>? _extInfo;
+
+  /// The signature algorithms the server accepts for `publickey`
+  /// authentication, as advertised through the `server-sig-algs` extension.
+  /// `null` when the server did not send it.
+  List<String>? get serverSigAlgs => _serverSigAlgs;
+  List<String>? _serverSigAlgs;
+
   /// Packets queued during key exchange that will be sent after NEW_KEYS
   final List<Uint8List> _rekeyPendingPackets = [];
 
@@ -263,10 +359,16 @@ class SSHTransport {
     }
 
     // Check if encryption is enabled and if we have MAC types initialized
-    final clientMacType = _clientMacType;
-    final serverMacType = _serverMacType;
-    final macType = isClient ? clientMacType : serverMacType;
-    final localCipherType = isClient ? _clientCipherType : _serverCipherType;
+    final macType = _localMacType;
+    final localCipherType = _localCipherType;
+
+    final localChaChaCipher = _localChaChaCipher;
+    if (localCipherType == SSHCipherType.chacha20poly1305 &&
+        localChaChaCipher != null) {
+      _sendChaChaPacket(data, localChaChaCipher);
+      _localPacketSN.increase();
+      return;
+    }
 
     if (localCipherType != null &&
         localCipherType.isAead &&
@@ -369,6 +471,29 @@ class SSHTransport {
     _localPacketSN.increase();
   }
 
+  /// Sends a packet using the OpenSSH ChaCha20-Poly1305 construction.
+  void _sendChaChaPacket(
+    Uint8List data,
+    OpenSSHChaCha20Poly1305 cipher,
+  ) {
+    final paddingLength = _alignedPaddingLength(
+      data.length,
+      OpenSSHChaCha20Poly1305.blockSize,
+    );
+    final packetLength = 1 + data.length + paddingLength;
+    final packet = Uint8List(4 + packetLength);
+    ByteData.sublistView(packet, 0, 4).setUint32(0, packetLength);
+    packet[4] = paddingLength;
+    packet.setRange(5, 5 + data.length, data);
+    packet.setRange(
+      5 + data.length,
+      packet.length,
+      randomBytes(paddingLength),
+    );
+
+    socket.sink.add(cipher.encryptPacket(packet, _localPacketSN.value));
+  }
+
   /// Sends a packet encrypted using AEAD (e.g. AES-GCM).
   ///
   /// Constructs the packet length and padding, generates random padding bytes,
@@ -445,13 +570,13 @@ class SSHTransport {
   }
 
   /// Closes the SSH transport, cancels the socket subscription, and terminates the connection.
-  void close() {
+  Future<void> close() async {
     printDebug?.call('SSHTransport.close');
     if (isClosed) return;
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.complete();
-    socket.destroy();
+    await socket.close();
   }
 
   /// Closes the SSH transport and completes the [done] future with an [error].
@@ -592,7 +717,12 @@ class SSHTransport {
 
       await _handleMessage(payload);
 
-      _remotePacketSN.increase();
+      if (_resetRemotePacketSN) {
+        _resetRemotePacketSN = false;
+        _remotePacketSN.reset();
+      } else {
+        _remotePacketSN.increase();
+      }
     }
   }
 
@@ -600,9 +730,77 @@ class SSHTransport {
   /// WITHOUT `packet length`, `padding length`, `padding` and `MAC`. Returns
   /// `null` if there is not enough data in the buffer to read the packet.
   Uint8List? _consumePacket() {
+    if (_remoteCipherType == SSHCipherType.chacha20poly1305 &&
+        _remoteChaChaCipher != null) {
+      return _consumeChaChaPacket();
+    }
     return (_decryptCipher == null && _remoteCipherKey == null)
         ? _consumeClearTextPacket()
         : _consumeEncryptedPacket();
+  }
+
+  /// Consumes and decrypts one OpenSSH ChaCha20-Poly1305 packet.
+  Uint8List? _consumeChaChaPacket() {
+    if (_buffer.length < OpenSSHChaCha20Poly1305.encryptedLengthSize) {
+      return null;
+    }
+
+    final cipher = _remoteChaChaCipher!;
+    final packetLength = cipher.decryptPacketLength(
+      _buffer.view(0, OpenSSHChaCha20Poly1305.encryptedLengthSize),
+      _remotePacketSN.value,
+    );
+    _verifyPacketLength(packetLength);
+    if (packetLength < 5) {
+      throw SSHPacketError('Packet too short: $packetLength');
+    }
+    if (packetLength % OpenSSHChaCha20Poly1305.blockSize != 0) {
+      throw SSHPacketError(
+        'Invalid packet alignment: $packetLength is not a multiple of '
+        '${OpenSSHChaCha20Poly1305.blockSize}',
+      );
+    }
+
+    final encryptedPacketLength = OpenSSHChaCha20Poly1305.encryptedLengthSize +
+        packetLength +
+        OpenSSHChaCha20Poly1305.tagSize;
+    if (_buffer.length < encryptedPacketLength) {
+      return null;
+    }
+
+    late Uint8List packet;
+    try {
+      packet = cipher.decryptPacket(
+        _buffer.view(0, encryptedPacketLength),
+        _remotePacketSN.value,
+      );
+    } on InvalidCipherTextException {
+      throw SSHPacketError('AEAD authentication failed');
+    }
+    _buffer.consume(encryptedPacketLength);
+
+    if (SSHPacket.readPacketLength(packet) != packetLength) {
+      throw SSHPacketError('Decrypted packet length changed unexpectedly');
+    }
+    final paddingLength = SSHPacket.readPaddingLength(packet);
+    final payloadLength = packetLength - paddingLength - 1;
+    if (payloadLength < 0) {
+      throw SSHPacketError(
+        'Invalid padding length: $paddingLength for packet length $packetLength',
+      );
+    }
+
+    final minimumPaddingLength = _alignedPaddingLength(
+      payloadLength,
+      OpenSSHChaCha20Poly1305.blockSize,
+    );
+    if (paddingLength < minimumPaddingLength) {
+      throw SSHPacketError(
+        'Invalid padding length: $paddingLength, expected: $minimumPaddingLength',
+      );
+    }
+
+    return Uint8List.sublistView(packet, 5, 5 + payloadLength);
   }
 
   /// Consumes and returns a single unencrypted packet payload from the buffer.
@@ -632,7 +830,7 @@ class SSHTransport {
   Uint8List? _consumeEncryptedPacket() {
     printDebug?.call('SSHTransport._consumeEncryptedPacket');
 
-    final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
+    final remoteCipherType = _remoteCipherType;
     if (remoteCipherType != null &&
         remoteCipherType.isAead &&
         _remoteCipherKey != null &&
@@ -645,7 +843,7 @@ class SSHTransport {
       return null;
     }
 
-    final macType = isClient ? _serverMacType! : _clientMacType!;
+    final macType = _remoteMacType!;
     final isEtm = macType.isEtm;
     final macLength = _remoteMac!.macSize;
 
@@ -879,25 +1077,48 @@ class SSHTransport {
     final cipherType = isClient ? _clientCipherType : _serverCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
 
-    _localCipherKey = _deriveKey(
-      isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
-      cipherType.keySize,
-    );
-    _localIV = _deriveKey(
-      isClient ? SSHDeriveKeyType.clientIV : SSHDeriveKeyType.serverIV,
-      cipherType.ivSize,
-    );
+    if (cipherType == SSHCipherType.chacha20poly1305) {
+      final key = _deriveKey(
+        isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
+        OpenSSHChaCha20Poly1305.keySize,
+      );
+      final chachaCipher = OpenSSHChaCha20Poly1305(key);
 
-    if (cipherType.isAead) {
+      _localCipherType = cipherType;
+      _localMacType = null;
+      _localChaChaCipher = chachaCipher;
+      _localCipherKey = null;
+      _localIV = null;
       _encryptCipher = null;
       _localMac = null;
       _localAeadPacketCount = 0;
       return;
     }
 
-    _encryptCipher = cipherType.createCipher(
-      _localCipherKey!,
-      _localIV!,
+    final cipherKey = _deriveKey(
+      isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
+      cipherType.keySize,
+    );
+    final iv = _deriveKey(
+      isClient ? SSHDeriveKeyType.clientIV : SSHDeriveKeyType.serverIV,
+      cipherType.ivSize,
+    );
+
+    if (cipherType.isAead) {
+      _localCipherType = cipherType;
+      _localMacType = null;
+      _localChaChaCipher = null;
+      _localCipherKey = cipherKey;
+      _localIV = iv;
+      _encryptCipher = null;
+      _localMac = null;
+      _localAeadPacketCount = 0;
+      return;
+    }
+
+    final encryptCipher = cipherType.createCipher(
+      cipherKey,
+      iv,
       forEncryption: true,
     );
 
@@ -908,8 +1129,16 @@ class SSHTransport {
       isClient ? SSHDeriveKeyType.clientMacKey : SSHDeriveKeyType.serverMacKey,
       macType.keySize,
     );
+    final mac = macType.createMac(macKey);
 
-    _localMac = macType.createMac(macKey);
+    _localCipherType = cipherType;
+    _localMacType = macType;
+    _localChaChaCipher = null;
+    _localCipherKey = cipherKey;
+    _localIV = iv;
+    _encryptCipher = encryptCipher;
+    _localMac = mac;
+    _localAeadPacketCount = 0;
   }
 
   /// Derives and applies the decryption and MAC keys for remote-to-local communication.
@@ -917,25 +1146,48 @@ class SSHTransport {
     final cipherType = isClient ? _serverCipherType : _clientCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
 
-    _remoteCipherKey = _deriveKey(
-      isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
-      cipherType.keySize,
-    );
-    _remoteIV = _deriveKey(
-      isClient ? SSHDeriveKeyType.serverIV : SSHDeriveKeyType.clientIV,
-      cipherType.ivSize,
-    );
+    if (cipherType == SSHCipherType.chacha20poly1305) {
+      final key = _deriveKey(
+        isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
+        OpenSSHChaCha20Poly1305.keySize,
+      );
+      final chachaCipher = OpenSSHChaCha20Poly1305(key);
 
-    if (cipherType.isAead) {
+      _remoteCipherType = cipherType;
+      _remoteMacType = null;
+      _remoteChaChaCipher = chachaCipher;
+      _remoteCipherKey = null;
+      _remoteIV = null;
       _decryptCipher = null;
       _remoteMac = null;
       _remoteAeadPacketCount = 0;
       return;
     }
 
-    _decryptCipher = cipherType.createCipher(
-      _remoteCipherKey!,
-      _remoteIV!,
+    final cipherKey = _deriveKey(
+      isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
+      cipherType.keySize,
+    );
+    final iv = _deriveKey(
+      isClient ? SSHDeriveKeyType.serverIV : SSHDeriveKeyType.clientIV,
+      cipherType.ivSize,
+    );
+
+    if (cipherType.isAead) {
+      _remoteCipherType = cipherType;
+      _remoteMacType = null;
+      _remoteChaChaCipher = null;
+      _remoteCipherKey = cipherKey;
+      _remoteIV = iv;
+      _decryptCipher = null;
+      _remoteMac = null;
+      _remoteAeadPacketCount = 0;
+      return;
+    }
+
+    final decryptCipher = cipherType.createCipher(
+      cipherKey,
+      iv,
       forEncryption: false,
     );
 
@@ -946,7 +1198,16 @@ class SSHTransport {
       isClient ? SSHDeriveKeyType.serverMacKey : SSHDeriveKeyType.clientMacKey,
       macType.keySize,
     );
-    _remoteMac = macType.createMac(macKey);
+    final mac = macType.createMac(macKey);
+
+    _remoteCipherType = cipherType;
+    _remoteMacType = macType;
+    _remoteChaChaCipher = null;
+    _remoteCipherKey = cipherKey;
+    _remoteIV = iv;
+    _decryptCipher = decryptCipher;
+    _remoteMac = mac;
+    _remoteAeadPacketCount = 0;
   }
 
   /// Derives a cryptographic key/IV of [keySize] bytes using KDF rules for the given [keyType].
@@ -956,7 +1217,7 @@ class SSHTransport {
       sharedSecret: _sharedSecret!,
       exchangeHash: _exchangeHash!,
       keyType: keyType,
-      sessionId: _sessionId!,
+      sessionId: sessionId!,
       keySize: keySize,
     );
   }
@@ -969,7 +1230,7 @@ class SSHTransport {
     required Uint8List publicKey,
   }) {
     final writer = SSHMessageWriter();
-    writer.writeString(_sessionId!);
+    writer.writeString(sessionId!);
     writer.writeUint8(SSH_Message_Userauth_Request.messageId);
     writer.writeUtf8(username);
     writer.writeUtf8(service);
@@ -977,6 +1238,28 @@ class SSHTransport {
     writer.writeBool(true);
     writer.writeUtf8(publicKeyAlgorithm);
     writer.writeString(publicKey);
+    return writer.takeBytes();
+  }
+
+  /// Composes the RFC 4252 hostbased authentication data to be signed.
+  Uint8List composeHostbasedChallenge({
+    required String username,
+    required String service,
+    required String hostKeyAlgorithm,
+    required Uint8List hostKey,
+    required String clientHostName,
+    required String clientUsername,
+  }) {
+    final writer = SSHMessageWriter();
+    writer.writeString(sessionId!);
+    writer.writeUint8(SSH_Message_Userauth_Request.messageId);
+    writer.writeUtf8(username);
+    writer.writeUtf8(service);
+    writer.writeUtf8('hostbased');
+    writer.writeUtf8(hostKeyAlgorithm);
+    writer.writeString(hostKey);
+    writer.writeUtf8(clientHostName);
+    writer.writeUtf8(clientUsername);
     return writer.takeBytes();
   }
 
@@ -1025,8 +1308,7 @@ class SSHTransport {
     _sentKexInit = true;
 
     final message = SSH_Message_KexInit(
-      kexAlgorithms: algorithms.kex.toNameList(),
-      // kexAlgorithms: ['curve25519-sha256'],
+      kexAlgorithms: _localKexAlgorithmNames(),
       serverHostKeyAlgorithms: algorithms.hostkey.toNameList(),
       encryptionClientToServer: algorithms.cipher.toNameList(),
       encryptionServerToClient: algorithms.cipher.toNameList(),
@@ -1042,6 +1324,28 @@ class SSHTransport {
 
     sendPacket(payload);
     printTrace?.call('-> $socket: $message');
+  }
+
+  /// The key exchange name-list we advertise, including the pseudo algorithms
+  /// that signal strict key exchange and EXT_INFO support.
+  ///
+  /// Both indicators are only meaningful in the first SSH_MSG_KEXINIT, so they
+  /// are dropped once the initial key exchange is done. Sending them on a
+  /// re-key would be ignored at best and confusing at worst.
+  List<String> _localKexAlgorithmNames() {
+    final names = algorithms.kex.toNameList();
+    if (!_isFirstKex) return names;
+    names.add(
+      isServer
+          ? SSHKexPseudoAlgorithm.strictKexServer
+          : SSHKexPseudoAlgorithm.strictKexClient,
+    );
+    names.add(
+      isServer
+          ? SSHKexPseudoAlgorithm.extInfoServer
+          : SSHKexPseudoAlgorithm.extInfoClient,
+    );
+    return names;
   }
 
   /// Send diffie-hellman key exchange message. The exact message format depends
@@ -1099,12 +1403,63 @@ class SSHTransport {
     final message = SSH_Message_NewKeys();
     printTrace?.call('-> $socket: $message');
     sendPacket(message.encode());
+
+    // [sendPacket] already advanced the sequence number past NEWKEYS, so under
+    // strict key exchange the reset belongs right here: the next packet we
+    // send is the first one of the new keys and must be number zero.
+    if (_strictKex) {
+      _localPacketSN.reset();
+    }
   }
 
   /// Dispatches the incoming decrypted packet payload to the appropriate message handler.
   Future<void> _handleMessage(Uint8List message) async {
     final messageId = SSHMessage.readMessageId(message);
+
+    // Under strict key exchange the optional transport messages are not
+    // allowed to appear between KEXINIT and NEWKEYS. Receiving one there means
+    // someone is padding the transcript, so the connection is torn down.
+    if (_strictKex &&
+        _isFirstKex &&
+        _kexInProgress &&
+        _isForbiddenDuringStrictKex(messageId)) {
+      throw SSHHandshakeError(
+        'Strict key exchange violation: message $messageId received during '
+        'key exchange',
+      );
+    }
+
     switch (messageId) {
+      case SSH_Message_Disconnect.messageId:
+        final disconnect = SSH_Message_Disconnect.decode(message);
+        printTrace?.call('<- $socket: $disconnect');
+        // The peer said why it is going away. Surface that instead of letting
+        // the caller see an unexplained disconnection.
+        return closeWithError(
+          SSHDisconnectError(
+            disconnect.reasonCode,
+            disconnect.description,
+          ),
+        );
+      case SSH_Message_Ignore.messageId:
+        final ignore = SSH_Message_Ignore.decode(message);
+        printTrace?.call('<- $socket: $ignore');
+        return;
+      case SSH_Message_Unimplemented.messageId:
+        final unimplemented = SSH_Message_Unimplemented.decode(message);
+        printTrace?.call('<- $socket: $unimplemented');
+        printDebug?.call(
+          'Received SSH_MSG_UNIMPLEMENTED for packet '
+          '${unimplemented.sequenceNumber}',
+        );
+        return;
+      case SSH_Message_Debug.messageId:
+        final debug = SSH_Message_Debug.decode(message);
+        printTrace?.call('<- $socket: $debug');
+        printDebug?.call(
+          'Remote: ${utf8.decode(debug.message, allowMalformed: true)}',
+        );
+        return;
       case SSH_Message_KexInit.messageId:
         return _handleMessageKexInit(message);
       case SSH_Message_KexDH_Reply.messageId:
@@ -1112,9 +1467,105 @@ class SSHTransport {
         return _handleMessageKexReply(message);
       case SSH_Message_NewKeys.messageId:
         return _handleMessageNewKeys(message);
+      case SSH_Message_ExtInfo.messageId:
+        if (_kexInProgress) {
+          return _handleUnexpectedKexMessage(messageId);
+        }
+        return _handleMessageExtInfo(message);
       default:
-        onPacket?.call(message);
+        if (_kexInProgress) {
+          return _handleUnexpectedKexMessage(messageId);
+        }
+
+        final messageHandler = onMessage;
+        if (messageHandler != null) {
+          if (messageHandler(message)) return;
+        } else {
+          // Deprecated path, kept so existing callers keep working. It
+          // cannot report whether the message was recognized, so nothing is
+          // ever answered with SSH_MSG_UNIMPLEMENTED on its behalf.
+          final packetHandler = onPacket;
+          if (packetHandler != null) {
+            packetHandler(message);
+            return;
+          }
+        }
+
+        _sendUnimplemented(messageId);
     }
+  }
+
+  /// Handles a message that is not valid during the current key exchange.
+  ///
+  /// OpenSSH disconnects for unexpected messages during the initial strict
+  /// key exchange. For non-strict exchanges and rekeys, it reports the
+  /// message as unimplemented.
+  void _handleUnexpectedKexMessage(int messageId) {
+    if (_strictKex && _isFirstKex) {
+      throw SSHHandshakeError(
+        'Strict key exchange violation: unexpected message $messageId '
+        'received during key exchange',
+      );
+    }
+    _sendUnimplemented(messageId);
+  }
+
+  /// Reports an unrecognized message using the rejected packet's sequence
+  /// number, before [_processPackets] advances it.
+  void _sendUnimplemented(int messageId) {
+    final message = SSH_Message_Unimplemented(_remotePacketSN.value);
+    printDebug?.call(
+      'Unsupported SSH message $messageId at packet '
+      '${_remotePacketSN.value}',
+    );
+    printTrace?.call('-> $socket: $message');
+    sendPacket(message.encode());
+  }
+
+  /// Records the extensions advertised by the peer in SSH_MSG_EXT_INFO.
+  void _handleMessageExtInfo(Uint8List payload) {
+    final message = SSH_Message_ExtInfo.decode(payload);
+    printDebug?.call('SSHTransport._handleMessageExtInfo');
+    printTrace?.call('<- $socket: $message');
+
+    _extInfo = message.extensions;
+    _serverSigAlgs = message.serverSigAlgs;
+  }
+
+  /// Enables strict key exchange when the peer advertised it in its first
+  /// SSH_MSG_KEXINIT, and validates the preconditions the mode requires.
+  ///
+  /// Strict key exchange is the Terrapin (CVE-2023-48795) countermeasure. Once
+  /// both sides have advertised it, the first SSH_MSG_KEXINIT must be the very
+  /// first packet of the connection: if it is not, packets were inserted or
+  /// removed before it and the exchange hash no longer covers the real
+  /// transcript.
+  void _negotiateStrictKex(SSH_Message_KexInit message) {
+    final peerIndicator = isServer
+        ? SSHKexPseudoAlgorithm.strictKexClient
+        : SSHKexPseudoAlgorithm.strictKexServer;
+
+    _strictKex = message.kexAlgorithms.contains(peerIndicator);
+    printDebug?.call('SSHTransport._strictKex = $_strictKex');
+
+    if (!_strictKex) return;
+
+    if (_remotePacketSN.value != 0) {
+      throw SSHHandshakeError(
+        'Strict key exchange violation: KEXINIT was not the first packet '
+        '(sequence number ${_remotePacketSN.value})',
+      );
+    }
+  }
+
+  /// Whether [messageId] is one of the optional transport messages that strict
+  /// key exchange forbids while a key exchange is running.
+  ///
+  /// SSH_MSG_IGNORE (2), SSH_MSG_UNIMPLEMENTED (3) and SSH_MSG_DEBUG (4) carry
+  /// no meaning for the exchange but do advance the sequence numbers, which is
+  /// exactly what the Terrapin attack abuses.
+  static bool _isForbiddenDuringStrictKex(int messageId) {
+    return messageId >= 2 && messageId <= 4;
   }
 
   /// Processes the KEXINIT message received from the remote peer and negotiates algorithms.
@@ -1136,6 +1587,10 @@ class SSHTransport {
     final message = SSH_Message_KexInit.decode(payload);
     printTrace?.call('<- $socket: $message');
     _remoteKexInit = payload;
+
+    if (_isFirstKex) {
+      _negotiateStrictKex(message);
+    }
 
     _kexType = SSHKexUtils.selectAlgorithm(
       localAlgorithms: algorithms.kex,
@@ -1356,7 +1811,15 @@ class SSHTransport {
     // Key exchange round finished.
     _kexInProgress = false;
     _sentKexInit = false;
+    _isFirstKex = false;
     _kex = null;
+
+    // The reset is deferred to [_processPackets]: this handler runs before the
+    // trailing increment for the NEWKEYS packet, so resetting here would be
+    // undone immediately.
+    if (_strictKex) {
+      _resetRemotePacketSN = true;
+    }
 
     // Flush any pending packets
     final pending = List<Uint8List>.from(_rekeyPendingPackets);

@@ -4,18 +4,21 @@ import 'dart:typed_data';
 
 import 'package:dartssh2/src/http/http_client.dart';
 import 'package:dartssh2/src/sftp/sftp_client.dart';
-import 'package:dartssh2/src/dynamic_forward.dart';
+import 'package:dartssh2/src/forward/dynamic_forward.dart';
 import 'package:dartssh2/src/ssh_algorithm.dart';
 import 'package:dartssh2/src/ssh_agent.dart';
 import 'package:dartssh2/src/ssh_channel.dart';
 import 'package:dartssh2/src/ssh_channel_id.dart';
 import 'package:dartssh2/src/ssh_errors.dart';
-import 'package:dartssh2/src/ssh_forward.dart';
+import 'package:dartssh2/src/forward/ssh_forward.dart';
 import 'package:dartssh2/src/ssh_keepalive.dart';
-import 'package:dartssh2/src/ssh_key_pair.dart';
+import 'package:dartssh2/src/ssh_identity.dart';
 import 'package:dartssh2/src/ssh_session.dart';
 import 'package:dartssh2/src/ssh_transport.dart';
 import 'package:dartssh2/src/utils/async_queue.dart';
+import 'package:dartssh2/src/utils/auth_methods.dart';
+import 'package:dartssh2/src/utils/pending_requests.dart';
+import 'package:dartssh2/src/utils/terminal_state.dart';
 import 'package:dartssh2/src/message/msg_channel.dart';
 import 'package:dartssh2/src/message/msg_request.dart';
 import 'package:dartssh2/src/message/msg_service.dart';
@@ -144,9 +147,21 @@ class SSHClient {
   /// null, the host key is accepted automatically.
   final SSHHostkeyVerifyHandler? onVerifyHostKey;
 
-  /// List of key pairs to use for authentication. Set this field to enable
-  /// authentication with public key.
-  final List<SSHKeyPair>? identities;
+  /// List of identities (key pairs or external signers) to use for
+  /// authentication. Set this field to enable authentication with public key.
+  final List<SSHIdentity>? identities;
+
+  /// Identities to use for RFC 4252 hostbased authentication.
+  ///
+  /// Unlike [identities], these represent keys belonging to the client host,
+  /// not the user logging in to the server.
+  final List<SSHIdentity>? hostbasedIdentities;
+
+  /// Fully qualified client host name sent during hostbased authentication.
+  final String? hostName;
+
+  /// Local account name sent during hostbased authentication.
+  final String? userNameOnClientHost;
 
   /// Set this field to enable the 'password' authentication method. Return null
   /// to skip to the next available authentication method.
@@ -215,6 +230,9 @@ class SSHClient {
     this.algorithms = const SSHAlgorithms(),
     this.onVerifyHostKey,
     this.identities,
+    this.hostbasedIdentities,
+    this.hostName,
+    this.userNameOnClientHost,
     this.onPasswordRequest,
     this.onChangePasswordRequest,
     this.onUserInfoRequest,
@@ -236,15 +254,16 @@ class SSHClient {
       algorithms: algorithms,
       onVerifyHostKey: onVerifyHostKey,
       onReady: _handleTransportReady,
-      onPacket: _handlePacket,
+      onMessage: _handlePacket,
       disableHostkeyVerification: disableHostkeyVerification,
       version: ident,
     );
 
     _transport.done.then(
       (_) => _handleTransportClosed(null),
-      onError: (e) => _handleTransportClosed(
-        e is SSHError ? e : SSHSocketError(e),
+      onError: (Object error, StackTrace stackTrace) => _handleTransportClosed(
+        error is SSHError ? error : SSHSocketError(error),
+        stackTrace,
       ),
     );
 
@@ -253,7 +272,11 @@ class SSHClient {
     );
 
     if (identities != null) {
-      _keyPairsLeft.addAll(identities!);
+      _identitiesLeft.addAll(identities!);
+    }
+
+    if (hostbasedIdentities != null) {
+      _hostbasedIdentitiesLeft.addAll(hostbasedIdentities!);
     }
 
     final handshakeTimeout = this.handshakeTimeout;
@@ -288,17 +311,32 @@ class SSHClient {
   /// completes with an error if the client could not authenticate.
   final _authenticated = Completer<void>();
 
-  final _globalRequestReplyQueue = AsyncQueue<SSHMessage>();
+  final _terminalState = TerminalState();
+
+  late final _globalRequestReplyQueue = AsyncQueue<SSHMessage>(
+    terminalState: _terminalState,
+  );
 
   final _channelIdAllocator = SSHChannelIdAllocator();
 
-  final _channelOpenReplyWaiters = <int, Completer<SSHMessage>>{};
+  /// Channels for which SSH_MSG_CHANNEL_OPEN has been sent and a matching
+  /// confirmation or failure has not yet been received.
+  late final _pendingChannelOpens =
+      PendingRequests<SSHChannelId, SSHChannelController>(
+    terminalState: _terminalState,
+  );
 
   final _channels = <int, SSHChannelController>{};
 
   final _authMethodsLeft = Queue<SSHAuthMethod>();
 
-  final _keyPairsLeft = Queue<SSHKeyPair>();
+  final _preferredAuthMethods = <SSHAuthMethod>[];
+
+  final _exhaustedAuthMethods = <SSHAuthMethod>{};
+
+  final _identitiesLeft = Queue<SSHIdentity>();
+
+  final _hostbasedIdentitiesLeft = Queue<SSHIdentity>();
 
   final _remoteForwards = <SSHRemoteForward>{};
 
@@ -307,6 +345,8 @@ class SSHClient {
       : null;
 
   SSHAuthMethod? _currentAuthMethod;
+
+  SSHIdentity? _currentProbedIdentity;
 
   var _transportReady = false;
 
@@ -322,6 +362,23 @@ class SSHClient {
   /// "SSH-2.0-OpenSSH_7.4p1". May be null if the handshake has not yet
   /// completed.
   String? get remoteVersion => _transport.remoteVersion;
+
+  /// Whether strict key exchange is in effect for this connection.
+  ///
+  /// It is negotiated automatically and requires the server to support it too.
+  /// Strict key exchange is the countermeasure against the Terrapin attack
+  /// (CVE-2023-48795), so a `false` here on an untrusted network means the
+  /// connection is only as safe as the negotiated cipher makes it.
+  ///
+  /// Meaningless before the first key exchange completes.
+  bool get strictKex => _transport.strictKex;
+
+  /// The signature algorithms the server accepts for `publickey`
+  /// authentication, taken from the `server-sig-algs` extension of
+  /// SSH_MSG_EXT_INFO (RFC 8308 §3.1).
+  ///
+  /// `null` when the server sent no EXT_INFO or omitted the extension.
+  List<String>? get serverSigAlgs => _transport.serverSigAlgs;
 
   /// Request connections to a port on the other side be forwarded to the local
   /// side.
@@ -342,8 +399,9 @@ class SSHClient {
     // Lisning on a random port if not specified.
     port ??= 0;
 
-    _sendMessage(SSH_Message_Global_Request.tcpipForward(host, port));
-    final reply = await _globalRequestReplyQueue.next;
+    final reply = await _sendGlobalRequest(
+      SSH_Message_Global_Request.tcpipForward(host, port),
+    );
 
     if (reply is SSH_Message_Request_Failure) return null;
 
@@ -368,14 +426,13 @@ class SSHClient {
 
     if (!_remoteForwards.remove(forward)) return false;
 
-    _sendMessage(
+    final reply = await _sendGlobalRequest(
       SSH_Message_Global_Request.cancelTcpipForward(
         bindAddress: forward.host,
         bindPort: forward.port,
       ),
     );
 
-    final reply = await _globalRequestReplyQueue.next;
     if (reply is SSH_Message_Request_Failure) {
       return false;
     }
@@ -631,6 +688,9 @@ class SSHClient {
 
   /// Execute [command] on the remote side non-interactively and return
   /// output together with exit metadata.
+  ///
+  /// If the standard output or standard error stream emits an error, the
+  /// session is closed and that error is rethrown to the caller.
   Future<SSHRunResult> runWithResult(
     String command, {
     bool runInPty = false,
@@ -650,7 +710,7 @@ class SSHClient {
     final stdoutDone = Completer<void>();
     final stderrDone = Completer<void>();
 
-    session.stdout.listen(
+    final stdoutSubscription = session.stdout.listen(
       stdout
           ? (data) {
               outputBuilder.add(data);
@@ -658,10 +718,11 @@ class SSHClient {
             }
           : (_) {},
       onDone: stdoutDone.complete,
-      onError: stderrDone.completeError,
+      onError: stdoutDone.completeError,
+      cancelOnError: true,
     );
 
-    session.stderr.listen(
+    final stderrSubscription = session.stderr.listen(
       stderr
           ? (data) {
               outputBuilder.add(data);
@@ -670,11 +731,24 @@ class SSHClient {
           : (_) {},
       onDone: stderrDone.complete,
       onError: stderrDone.completeError,
+      cancelOnError: true,
     );
 
-    await stdoutDone.future;
-    await stderrDone.future;
-    await session.done;
+    // Both futures must be awaited together. Awaiting them one after the other
+    // would leave the second one without an error handler until the first one
+    // completes, turning an error on that stream into an uncaught error.
+    try {
+      await Future.wait(
+        [stdoutDone.future, stderrDone.future],
+        eagerError: true,
+      );
+      await session.done;
+    } catch (_) {
+      await stdoutSubscription.cancel();
+      await stderrSubscription.cancel();
+      session.close();
+      rethrow;
+    }
 
     return SSHRunResult(
       output: outputBuilder.takeBytes(),
@@ -688,17 +762,18 @@ class SSHClient {
   /// Send a empty message to the server to keep the connection alive.
   Future<void> ping() async {
     await _authenticated.future;
-    _sendMessage(SSH_Message_Global_Request.keepAlive());
-    await _globalRequestReplyQueue.next;
+    await _sendGlobalRequest(SSH_Message_Global_Request.keepAlive());
   }
 
   /// Shutdown the entire SSH connection. Sessions and channels will also be
   /// closed immediately.
-  void close() {
+  Future<void> close() async {
     _handshakeTimeoutTimer?.cancel();
     _authTimeoutTimer?.cancel();
-    _closeChannels();
-    _transport.close();
+    final error = SSHStateError('SSH client closed');
+    _terminatePendingOperations(error);
+    _closeChannels(error);
+    await _transport.close();
   }
 
   /// Force flush any buffered outgoing data to the socket.
@@ -707,9 +782,9 @@ class SSHClient {
   }
 
   /// Close all channels that are currently open.
-  void _closeChannels() {
+  void _closeChannels([Object? error, StackTrace? stackTrace]) {
     for (final channel in _channels.values) {
-      channel.destroy();
+      channel.destroy(error, stackTrace);
       _channelIdAllocator.release(channel.localId);
     }
 
@@ -730,7 +805,7 @@ class SSHClient {
     _requestAuthentication();
   }
 
-  void _handleTransportClosed(SSHError? error) {
+  void _handleTransportClosed(SSHError? error, [StackTrace? stackTrace]) {
     printDebug?.call('SSHClient._onTransportClosed');
     _handshakeTimeoutTimer?.cancel();
     _handshakeTimeoutTimer = null;
@@ -744,27 +819,38 @@ class SSHClient {
     }
     _keepAlive?.stop();
 
-    // Complete any pending channel-open waiters so callers (e.g.
-    // forwardLocalUnix) don't hang forever when the connection drops.
-    for (final entry in _channelOpenReplyWaiters.entries) {
-      if (!entry.value.isCompleted) {
-        entry.value.completeError(
-          SSHStateError('Connection closed while waiting for channel open'),
-        );
-      }
-    }
-    _channelOpenReplyWaiters.clear();
+    final terminalError = error ?? SSHStateError('SSH connection closed');
+    _terminatePendingOperations(terminalError, stackTrace);
 
     try {
-      _closeChannels();
+      _closeChannels(terminalError, stackTrace);
     } catch (e) {
       printDebug?.call("SSHClient::_handleTransportClosed - error: $e");
     }
   }
 
-  void _handlePacket(Uint8List payload) {
+  void _terminatePendingOperations(Object error, [StackTrace? stackTrace]) {
+    _globalRequestReplyQueue.closeWithError(error, stackTrace);
+
+    for (final id in _pendingChannelOpens.keys) {
+      _channelIdAllocator.release(id);
+    }
+    _pendingChannelOpens.closeWithError(error, stackTrace);
+  }
+
+  Future<SSHMessage> _sendGlobalRequest(SSHMessage request) async {
+    final reply = _globalRequestReplyQueue.next;
     try {
-      _dispatchMessage(payload);
+      _sendMessage(request);
+    } catch (error, stackTrace) {
+      _terminatePendingOperations(error, stackTrace);
+    }
+    return await reply;
+  }
+
+  bool _handlePacket(Uint8List payload) {
+    try {
+      return _dispatchMessage(payload);
     } catch (e) {
       rethrow;
     }
@@ -773,6 +859,10 @@ class SSHClient {
   /// Handles a raw SSH packet. This method is only exposed for testing purposes.
   @visibleForTesting
   void handlePacket(Uint8List packet) => _handlePacket(packet);
+
+  /// Sets the session ID on transport. This method is only exposed for testing purposes.
+  @visibleForTesting
+  set sessionId(Uint8List? value) => _transport.sessionId = value;
 
   void _sendMessage(SSHMessage message) {
     printTrace?.call('-> $socket: $message');
@@ -785,49 +875,69 @@ class SSHClient {
     });
   }
 
-  void _dispatchMessage(Uint8List message) {
+  bool _dispatchMessage(Uint8List message) {
     final messageId = SSHMessage.readMessageId(message);
     switch (messageId) {
       case SSH_Message_Service_Accept.messageId:
-        return _handleServiceAccept(message);
+        _handleServiceAccept(message);
+        return true;
       case SSH_Message_Userauth_Success.messageId:
-        return _handleUserauthSuccess();
+        _handleUserauthSuccess();
+        return true;
       case SSH_Message_Userauth_Failure.messageId:
-        return _handleUserauthFailure(message);
+        _handleUserauthFailure(message);
+        return true;
       case SSH_Message_Userauth_Passwd_ChangeReq.messageId:
-        return _handleUserauthIntermidiate(message);
+        _handleUserauthIntermidiate(message);
+        return true;
       case SSH_Message_Userauth_Banner.messageId:
-        return _handleUserauthBanner(message);
+        _handleUserauthBanner(message);
+        return true;
       case SSH_Message_Global_Request.messageId:
-        return _handleGlobalRequest(message);
+        _handleGlobalRequest(message);
+        return true;
       case SSH_Message_Request_Success.messageId:
-        return _handleGlobalRequestSuccess(message);
+        _handleGlobalRequestSuccess(message);
+        return true;
       case SSH_Message_Request_Failure.messageId:
-        return _handleGlobalRequestFailure(message);
+        _handleGlobalRequestFailure(message);
+        return true;
       case SSH_Message_Channel_Open.messageId:
-        return _handleChannelOpen(message);
+        _handleChannelOpen(message);
+        return true;
       case SSH_Message_Channel_Confirmation.messageId:
-        return _handleChannelConfirmation(message);
+        _handleChannelConfirmation(message);
+        return true;
       case SSH_Message_Channel_Open_Failure.messageId:
-        return _handleChannelOpenFailure(message);
+        _handleChannelOpenFailure(message);
+        return true;
       case SSH_Message_Channel_Window_Adjust.messageId:
-        return _handleChannelWindowAdjust(message);
+        _handleChannelWindowAdjust(message);
+        return true;
       case SSH_Message_Channel_Success.messageId:
-        return _handleChannelSuccess(message);
+        _handleChannelSuccess(message);
+        return true;
       case SSH_Message_Channel_Failure.messageId:
-        return _handleChannelFailure(message);
+        _handleChannelFailure(message);
+        return true;
       case SSH_Message_Channel_Data.messageId:
-        return _handleChannelData(message);
+        _handleChannelData(message);
+        return true;
       case SSH_Message_Channel_Extended_Data.messageId:
-        return _handleChannelExtendedData(message);
+        _handleChannelExtendedData(message);
+        return true;
       case SSH_Message_Channel_EOF.messageId:
-        return _handleChannelEOF(message);
+        _handleChannelEOF(message);
+        return true;
       case SSH_Message_Channel_Close.messageId:
-        return _handleChannelClose(message);
+        _handleChannelClose(message);
+        return true;
       case SSH_Message_Channel_Request.messageId:
-        return _handleChannelRequest(message);
+        _handleChannelRequest(message);
+        return true;
       default:
         printDebug?.call('unknown messageId: $messageId');
+        return false;
     }
   }
 
@@ -875,6 +985,28 @@ class SSHClient {
     final message = SSH_Message_Userauth_Failure.decode(payload);
     printTrace?.call('<- $socket: $message');
     printDebug?.call('SSHClient._handleUserauthFailure');
+    _currentProbedIdentity = null;
+
+    if (message.partialSuccess) {
+      printDebug?.call(
+        'Authentication partially succeeded with '
+        '${_currentAuthMethod?.name}',
+      );
+      _resetAuthStateForNextFactor();
+    } else {
+      _markCurrentAuthMethodAttempted();
+    }
+
+    final continuableMethods = selectContinuableAuthMethods(
+      preferredMethods: _preferredAuthMethods,
+      serverMethods: message.methodsLeft,
+      availableMethods: _availableAuthMethods,
+      onNote: printDebug,
+    );
+    _authMethodsLeft
+      ..clear()
+      ..addAll(continuableMethods);
+
     _tryNextAuthMethod();
   }
 
@@ -886,9 +1018,44 @@ class SSHClient {
         return _catch(() => _handleUserauthPasswordChangeRequest(payload));
       case SSHAuthMethod.keyboardInteractive:
         return _catch(() => _handleUserauthInfoRequest(payload));
+      case SSHAuthMethod.publicKey:
+        return _catch(() => _handleUserauthPKOk(payload));
       default:
         printDebug?.call('unknown auth method: $_currentAuthMethod');
     }
+  }
+
+  Future<void> _handleUserauthPKOk(Uint8List payload) async {
+    printDebug?.call('SSHClient._handleUserauthPKOk');
+    final message = SSH_Message_Userauth_PK_Ok.decode(payload);
+    printTrace?.call('<- $socket: $message');
+
+    final identity = _currentProbedIdentity;
+    if (identity == null) return;
+    _currentProbedIdentity = null;
+
+    final publicKeyBlob = identity.toPublicKey().encode();
+    final challenge = _transport.composeChallenge(
+      username: username,
+      service: 'ssh-connection',
+      publicKeyAlgorithm: identity.type,
+      publicKey: publicKeyBlob,
+    );
+
+    final signature = await identity.sign(challenge);
+
+    if (isClosed || _currentAuthMethod != SSHAuthMethod.publicKey) {
+      return;
+    }
+
+    _sendMessage(
+      SSH_Message_Userauth_Request.publicKey(
+        username: username,
+        publicKeyAlgorithm: identity.type,
+        publicKey: publicKeyBlob,
+        signature: signature.encode(),
+      ),
+    );
   }
 
   Future<void> _handleUserauthPasswordChangeRequest(Uint8List payload) async {
@@ -897,7 +1064,10 @@ class SSHClient {
     printTrace?.call('<- $socket: $message');
 
     final response = await onChangePasswordRequest!(message.prompt);
-    if (response == null) return _tryNextAuthMethod();
+    if (response == null) {
+      _exhaustedAuthMethods.add(SSHAuthMethod.password);
+      return _tryNextAuthMethod();
+    }
 
     _sendMessage(SSH_Message_Userauth_Request.newPassword(
       user: username,
@@ -915,7 +1085,10 @@ class SSHClient {
       SSHUserInfoRequest(message.name, message.instruction, message.prompts),
     );
 
-    if (responses == null) return _tryNextAuthMethod();
+    if (responses == null) {
+      _exhaustedAuthMethods.add(SSHAuthMethod.keyboardInteractive);
+      return _tryNextAuthMethod();
+    }
 
     if (responses.length != message.prompts.length) {
       throw ArgumentError(
@@ -1023,14 +1196,14 @@ class SSHClient {
       data: Uint8List(0),
     );
 
-    _sendMessage(confirmation);
-
     final channelController = _acceptChannel(
       localChannelId: localChannelId,
       remoteChannelId: message.senderChannel,
       remoteInitialWindowSize: message.initialWindowSize,
       remoteMaximumPacketSize: message.maximumPacketSize,
     );
+
+    _sendMessage(confirmation);
 
     remoteForward._connections.add(
       SSHForwardChannel(channelController.channel),
@@ -1060,14 +1233,14 @@ class SSHClient {
       data: Uint8List(0),
     );
 
-    _sendMessage(confirmation);
-
     final channelController = _acceptChannel(
       localChannelId: localChannelId,
       remoteChannelId: message.senderChannel,
       remoteInitialWindowSize: message.initialWindowSize,
       remoteMaximumPacketSize: message.maximumPacketSize,
     );
+
+    _sendMessage(confirmation);
 
     onX11Forward!(
       SSHX11Channel(
@@ -1099,14 +1272,14 @@ class SSHClient {
       maximumPacketSize: _maximumPacketSize,
       data: Uint8List(0),
     );
-    _sendMessage(confirmation);
-
     final channelController = _acceptChannel(
       localChannelId: localChannelId,
       remoteChannelId: message.senderChannel,
       remoteInitialWindowSize: message.initialWindowSize,
       remoteMaximumPacketSize: message.maximumPacketSize,
     );
+
+    _sendMessage(confirmation);
 
     SSHAgentChannel(
       channelController.channel,
@@ -1126,24 +1299,32 @@ class SSHClient {
   void _handleChannelConfirmation(Uint8List payload) {
     final message = SSH_Message_Channel_Confirmation.decode(payload);
     printTrace?.call('<- $socket: $message');
-    // Register the channel synchronously BEFORE completing the future.
-    // CHANNEL_DATA for this channel may arrive in the same TCP segment as
-    // the CONFIRMATION. If we defer registration to the async continuation
-    // of _waitChannelOpen, that data hits _handleChannelData while
-    // _channels[id] is still null and is silently dropped.
-    _acceptChannel(
+
+    _requirePendingChannelOpen(message.recipientChannel, 'confirmation');
+
+    // Register synchronously before completing the future. CHANNEL_DATA may
+    // immediately follow the confirmation in the same transport input.
+    final channelController = _acceptChannel(
       localChannelId: message.recipientChannel,
       remoteChannelId: message.senderChannel,
       remoteInitialWindowSize: message.initialWindowSize,
       remoteMaximumPacketSize: message.maximumPacketSize,
     );
-    _dispatchChannelOpenReply(message.recipientChannel, message);
+
+    _pendingChannelOpens.complete(message.recipientChannel, channelController);
   }
 
   void _handleChannelOpenFailure(Uint8List payload) {
     final message = SSH_Message_Channel_Open_Failure.decode(payload);
     printTrace?.call('<- $socket: $message');
-    _dispatchChannelOpenReply(message.recipientChannel, message);
+
+    _requirePendingChannelOpen(message.recipientChannel, 'failure');
+
+    _channelIdAllocator.release(message.recipientChannel);
+    _pendingChannelOpens.fail(
+      message.recipientChannel,
+      SSHChannelOpenError(message.reasonCode, message.description),
+    );
   }
 
   void _handleChannelWindowAdjust(Uint8List payload) {
@@ -1208,30 +1389,33 @@ class SSHClient {
     printDebug?.call('SSHClient._startAuthentication');
 
     if (identities != null && identities!.isNotEmpty) {
-      _authMethodsLeft.add(SSHAuthMethod.publicKey);
+      _preferredAuthMethods.add(SSHAuthMethod.publicKey);
     }
 
     if (onPasswordRequest != null) {
-      _authMethodsLeft.add(SSHAuthMethod.password);
+      _preferredAuthMethods.add(SSHAuthMethod.password);
     }
 
     if (onUserInfoRequest != null) {
-      _authMethodsLeft.add(SSHAuthMethod.keyboardInteractive);
+      _preferredAuthMethods.add(SSHAuthMethod.keyboardInteractive);
     }
 
-    _authMethodsLeft.add(SSHAuthMethod.none);
+    if (hostbasedIdentities != null &&
+        hostbasedIdentities!.isNotEmpty &&
+        hostName != null &&
+        userNameOnClientHost != null) {
+      _preferredAuthMethods.add(SSHAuthMethod.hostbased);
+    }
+
+    _authMethodsLeft
+      ..addAll(_preferredAuthMethods)
+      ..add(SSHAuthMethod.none);
 
     _tryNextAuthMethod();
   }
 
   void _tryNextAuthMethod() {
     printDebug?.call('SSHClient._tryNextAuthenticationMethod');
-
-    if (_currentAuthMethod == SSHAuthMethod.publicKey) {
-      if (_keyPairsLeft.isNotEmpty) {
-        return _authWithNextPublicKey();
-      }
-    }
 
     if (_authMethodsLeft.isEmpty) {
       return _authenticated.completeError(
@@ -1249,9 +1433,11 @@ class SSHClient {
       case SSHAuthMethod.password:
         return _catch(() => _authWithPassword());
       case SSHAuthMethod.publicKey:
-        return _authWithNextPublicKey();
+        return _catch(() => _authWithNextPublicKey());
       case SSHAuthMethod.keyboardInteractive:
         return _authWithKeyboardInteractive();
+      case SSHAuthMethod.hostbased:
+        return _catch(() => _authWithNextHostbased());
     }
   }
 
@@ -1265,6 +1451,7 @@ class SSHClient {
 
     final password = await onPasswordRequest!();
     if (password == null) {
+      _exhaustedAuthMethods.add(SSHAuthMethod.password);
       _tryNextAuthMethod();
       return;
     }
@@ -1274,25 +1461,54 @@ class SSHClient {
     );
   }
 
-  void _authWithNextPublicKey() {
+  Future<void> _authWithNextPublicKey() async {
     printDebug?.call('SSHClient._authWithPublicKey');
 
-    final keyPair = _keyPairsLeft.removeFirst();
+    if (_identitiesLeft.isEmpty) {
+      _exhaustedAuthMethods.add(SSHAuthMethod.publicKey);
+      _tryNextAuthMethod();
+      return;
+    }
+
+    final identity = _identitiesLeft.removeFirst();
+    final publicKey = identity.toPublicKey();
+    final publicKeyBlob = publicKey.encode();
+
+    if (identity.shouldProbe) {
+      printDebug?.call(
+        'Probing public key for identity: ${identity.comment ?? identity.type}',
+      );
+      _currentProbedIdentity = identity;
+      _sendMessage(
+        SSH_Message_Userauth_Request.publicKey(
+          username: username,
+          publicKeyAlgorithm: identity.type,
+          publicKey: publicKeyBlob,
+          signature: null,
+        ),
+      );
+      return;
+    }
 
     final challenge = _transport.composeChallenge(
       username: username,
       service: 'ssh-connection',
-      publicKeyAlgorithm: keyPair.type,
-      publicKey: keyPair.toPublicKey().encode(),
+      publicKeyAlgorithm: identity.type,
+      publicKey: publicKeyBlob,
     );
+
+    final signature = await identity.sign(challenge);
+
+    if (isClosed || _currentAuthMethod != SSHAuthMethod.publicKey) {
+      return;
+    }
 
     _sendMessage(
       SSH_Message_Userauth_Request.publicKey(
         username: username,
-        publicKeyAlgorithm: keyPair.type,
-        publicKey: keyPair.toPublicKey().encode(),
-        signature: keyPair.sign(challenge).encode(),
-        // signature: null,
+        publicKeyAlgorithm: identity.type,
+        publicKey: publicKeyBlob,
+        signature: signature.encode(),
       ),
     );
   }
@@ -1304,7 +1520,91 @@ class SSHClient {
     );
   }
 
-  Future<SSHChannelController> _openSessionChannel() async {
+  Future<void> _authWithNextHostbased() async {
+    printDebug?.call('SSHClient._authWithHostbased');
+
+    if (_hostbasedIdentitiesLeft.isEmpty) {
+      _exhaustedAuthMethods.add(SSHAuthMethod.hostbased);
+      _tryNextAuthMethod();
+      return;
+    }
+
+    final identity = _hostbasedIdentitiesLeft.removeFirst();
+    final hostKey = identity.toPublicKey().encode();
+    final challenge = _transport.composeHostbasedChallenge(
+      username: username,
+      service: 'ssh-connection',
+      hostKeyAlgorithm: identity.type,
+      hostKey: hostKey,
+      clientHostName: hostName!,
+      clientUsername: userNameOnClientHost!,
+    );
+    final signature = await identity.sign(challenge);
+
+    if (isClosed || _currentAuthMethod != SSHAuthMethod.hostbased) {
+      return;
+    }
+
+    _sendMessage(
+      SSH_Message_Userauth_Request.hostbased(
+        username: username,
+        hostKeyAlgorithm: identity.type,
+        hostKey: hostKey,
+        clientHostName: hostName!,
+        clientUsername: userNameOnClientHost!,
+        signature: signature.encode(),
+      ),
+    );
+  }
+
+  Set<SSHAuthMethod> get _availableAuthMethods => {
+        if (_identitiesLeft.isNotEmpty) SSHAuthMethod.publicKey,
+        if (!_exhaustedAuthMethods.contains(SSHAuthMethod.password) &&
+            onPasswordRequest != null)
+          SSHAuthMethod.password,
+        if (!_exhaustedAuthMethods
+                .contains(SSHAuthMethod.keyboardInteractive) &&
+            onUserInfoRequest != null)
+          SSHAuthMethod.keyboardInteractive,
+        if (_hostbasedIdentitiesLeft.isNotEmpty &&
+            hostName != null &&
+            userNameOnClientHost != null)
+          SSHAuthMethod.hostbased,
+      };
+
+  void _markCurrentAuthMethodAttempted() {
+    switch (_currentAuthMethod) {
+      case SSHAuthMethod.password:
+      case SSHAuthMethod.keyboardInteractive:
+      case SSHAuthMethod.none:
+        _exhaustedAuthMethods.add(_currentAuthMethod!);
+        break;
+      case SSHAuthMethod.publicKey:
+        if (_identitiesLeft.isEmpty) {
+          _exhaustedAuthMethods.add(SSHAuthMethod.publicKey);
+        }
+        break;
+      case SSHAuthMethod.hostbased:
+        if (_hostbasedIdentitiesLeft.isEmpty) {
+          _exhaustedAuthMethods.add(SSHAuthMethod.hostbased);
+        }
+        break;
+      case null:
+        break;
+    }
+  }
+
+  void _resetAuthStateForNextFactor() {
+    _exhaustedAuthMethods.clear();
+    // OpenSSH resets public-key attempt state after partial success so the
+    // next authentication factor may use publickey again. Hostbased keys are
+    // consumed as they are tried and are intentionally not replenished.
+    _identitiesLeft
+      ..clear()
+      ..addAll(identities ?? const <SSHIdentity>[]);
+  }
+
+  Future<SSHChannelController> _openSessionChannel() {
     final localChannelId = _channelIdAllocator.allocate();
 
     final request = SSH_Message_Channel_Open.session(
@@ -1312,9 +1612,7 @@ class SSHClient {
       initialWindowSize: _initialWindowSize,
       maximumPacketSize: _maximumPacketSize,
     );
-    _sendMessage(request);
-
-    return await _waitChannelOpen(localChannelId);
+    return _openChannel(localChannelId, request);
   }
 
   Future<SSHChannelController> _openForwardLocalChannel(
@@ -1322,7 +1620,7 @@ class SSHClient {
     int bindPort,
     String remoteAddress,
     int remotePort,
-  ) async {
+  ) {
     final localChannelId = _channelIdAllocator.allocate();
 
     final request = SSH_Message_Channel_Open.directTcpip(
@@ -1334,14 +1632,12 @@ class SSHClient {
       originatorIP: bindAddress,
       originatorPort: bindPort,
     );
-    _sendMessage(request);
-
-    return await _waitChannelOpen(localChannelId);
+    return _openChannel(localChannelId, request);
   }
 
   Future<SSHChannelController> _openForwardLocalUnixChannel(
     String socketPath,
-  ) async {
+  ) {
     final localChannelId = _channelIdAllocator.allocate();
 
     final request = SSH_Message_Channel_Open.directStreamLocal(
@@ -1350,21 +1646,32 @@ class SSHClient {
       maximumPacketSize: _maximumPacketSize,
       socketPath: socketPath,
     );
-    _sendMessage(request);
-
-    return await _waitChannelOpen(localChannelId);
+    return _openChannel(localChannelId, request);
   }
 
-  Future<SSHChannelController> _waitChannelOpen(
+  Future<SSHChannelController> _openChannel(
     SSHChannelId localChannelId,
-  ) async {
-    final message = await _waitChannelOpenReply(localChannelId);
-    if (message is SSH_Message_Channel_Open_Failure) {
-      throw SSHChannelOpenError(message.reasonCode, message.description);
+    SSH_Message_Channel_Open request,
+  ) {
+    if (_pendingChannelOpens.isWaiting(localChannelId) ||
+        _channels.containsKey(localChannelId)) {
+      throw SSHStateError('Channel $localChannelId is already in use');
     }
 
-    // Channel was already registered synchronously in _handleChannelConfirmation.
-    return _channels[localChannelId]!;
+    // Registered before sending so a reply delivered synchronously by the
+    // transport still finds its waiter.
+    final reply = _pendingChannelOpens.wait(localChannelId);
+
+    try {
+      _sendMessage(request);
+    } catch (error, stackTrace) {
+      if (_pendingChannelOpens.fail(localChannelId, error, stackTrace)) {
+        _channelIdAllocator.release(localChannelId);
+      }
+      rethrow;
+    }
+
+    return reply;
   }
 
   SSHChannelController _acceptChannel({
@@ -1373,6 +1680,10 @@ class SSHClient {
     required int remoteInitialWindowSize,
     required int remoteMaximumPacketSize,
   }) {
+    if (_channels.containsKey(localChannelId)) {
+      throw SSHStateError('Channel $localChannelId is already open');
+    }
+
     final channelController = SSHChannelController(
       localId: localChannelId,
       localInitialWindowSize: _initialWindowSize,
@@ -1389,23 +1700,11 @@ class SSHClient {
     return channelController;
   }
 
-  Future<SSHMessage> _waitChannelOpenReply(SSHChannelId id) async {
-    if (_channelOpenReplyWaiters.containsKey(id)) {
-      printDebug?.call('_waitChannelOpenReply: already waiting for $id');
-      return _channelOpenReplyWaiters[id]!.future;
-    }
-    final replyCompleter = Completer<SSHMessage>();
-    _channelOpenReplyWaiters[id] = replyCompleter;
-    return replyCompleter.future;
-  }
-
-  void _dispatchChannelOpenReply(SSHChannelId id, SSHMessage message) {
-    if (!_channelOpenReplyWaiters.containsKey(id)) {
-      printDebug?.call('_dispatchChannelOpenReply: no pending request for $id');
-      return;
-    }
-    final replyCompleter = _channelOpenReplyWaiters.remove(id)!;
-    replyCompleter.complete(message);
+  void _requirePendingChannelOpen(SSHChannelId id, String replyType) {
+    if (_pendingChannelOpens.isWaiting(id)) return;
+    throw SSHStateError(
+      'Received channel open $replyType for non-opening channel $id',
+    );
   }
 }
 

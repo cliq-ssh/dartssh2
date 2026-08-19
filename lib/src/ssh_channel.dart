@@ -4,11 +4,15 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:dartssh2/src/ssh_channel_id.dart';
+import 'package:dartssh2/src/ssh_errors.dart';
 import 'package:dartssh2/src/ssh_transport.dart';
 import 'package:dartssh2/src/utils/async_queue.dart';
 import 'package:dartssh2/src/message/msg_channel.dart';
 import 'package:dartssh2/src/ssh_message.dart';
 import 'package:dartssh2/src/utils/stream.dart';
+import 'package:dartssh2/src/utils/terminal_state.dart';
+
+const _maxChannelWindow = 0xffffffff;
 
 /// Handler of channel requests. Return true if the request was handled, false
 /// if the request was not recognized or could not be handled.
@@ -68,8 +72,12 @@ class SSHChannelController {
   /// Handler of channel requests from the remote side.
   late var _requestHandler = _defaultRequestHandler;
 
+  final _terminalState = TerminalState();
+
   /// An [AsyncQueue] of pending request replies from the remote side.
-  final _requestReplyQueue = AsyncQueue<bool>();
+  late final _requestReplyQueue = AsyncQueue<bool>(
+    terminalState: _terminalState,
+  );
 
   /// true if we have sent an EOF message to the remote side.
   var _hasSentEOF = false;
@@ -79,15 +87,14 @@ class SSHChannelController {
 
   final _done = Completer<void>();
 
-  Future<bool> sendExec(String command) async {
-    sendMessage(
+  Future<bool> sendExec(String command) {
+    return _sendRequest(
       SSH_Message_Channel_Request.exec(
         recipientChannel: remoteId,
         wantReply: true,
         command: command,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendPtyReq({
@@ -97,8 +104,8 @@ class SSHChannelController {
     int terminalPixelWidth = 0,
     int terminalPixelHeight = 0,
     Uint8List? terminalModes,
-  }) async {
-    sendMessage(
+  }) {
+    return _sendRequest(
       SSH_Message_Channel_Request.pty(
         recipientChannel: remoteId,
         termType: terminalType,
@@ -110,17 +117,15 @@ class SSHChannelController {
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
-  Future<bool> sendShell() async {
-    sendMessage(
+  Future<bool> sendShell() {
+    return _sendRequest(
       SSH_Message_Channel_Request.shell(
         recipientChannel: remoteId,
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendX11Req({
@@ -128,44 +133,41 @@ class SSHChannelController {
     String authenticationProtocol = 'MIT-MAGIC-COOKIE-1',
     required String authenticationCookie,
     int screenNumber = 0,
-  }) async {
-    sendMessage(
+  }) {
+    return _sendRequest(
       SSH_Message_Channel_Request.x11(
         recipientChannel: remoteId,
         wantReply: true,
         singleConnection: singleConnection,
         x11AuthenticationProtocol: authenticationProtocol,
         x11AuthenticationCookie: authenticationCookie,
-        x11ScreenNumber: screenNumber.toString(),
+        x11ScreenNumber: screenNumber,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
-  Future<bool> sendAgentForwardingRequest() async {
-    sendMessage(
+  Future<bool> sendAgentForwardingRequest() {
+    return _sendRequest(
       SSH_Message_Channel_Request(
         recipientChannel: remoteId,
         requestType: SSHChannelRequestType.authAgent,
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
-  Future<bool> sendSubsystem(String subsystem) async {
-    sendMessage(
+  Future<bool> sendSubsystem(String subsystem) {
+    return _sendRequest(
       SSH_Message_Channel_Request.subsystem(
         recipientChannel: remoteId,
         subsystemName: subsystem,
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
-  Future<bool> sendEnv(String name, String value) async {
-    sendMessage(
+  Future<bool> sendEnv(String name, String value) {
+    return _sendRequest(
       SSH_Message_Channel_Request.env(
         recipientChannel: remoteId,
         variableName: name,
@@ -173,10 +175,10 @@ class SSHChannelController {
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   void sendSignal(String signal) {
+    _terminalState.throwIfTerminated();
     sendMessage(
       SSH_Message_Channel_Request.signal(
         recipientChannel: remoteId,
@@ -191,6 +193,7 @@ class SSHChannelController {
     required int pixelWidth,
     required int pixelHeight,
   }) {
+    _terminalState.throwIfTerminated();
     sendMessage(
       SSH_Message_Channel_Request.windowChange(
         recipientChannel: remoteId,
@@ -234,7 +237,7 @@ class SSHChannelController {
 
     if (_remoteStream.isClosed) {
       _sendCloseIfNeeded();
-      _done.complete();
+      _finish(SSHStateError('Channel closed before receiving request reply'));
       return;
     }
 
@@ -244,13 +247,34 @@ class SSHChannelController {
   /// Closes the channel immediately in both directions. This may send a close
   /// message to the remote side. After this no more data can be sent or
   /// received.
-  void destroy() {
+  void destroy([Object? error, StackTrace? stackTrace]) {
     if (_done.isCompleted) return;
     _remoteStream.close();
     _locaStreamConsumer.cancel();
     _sendEOFIfNeeded();
     _sendCloseIfNeeded();
-    _done.complete();
+    _finish(
+      error ?? SSHStateError('Channel destroyed before receiving reply'),
+      stackTrace,
+    );
+  }
+
+  Future<bool> _sendRequest(SSHMessage request) async {
+    final reply = _requestReplyQueue.next;
+    try {
+      sendMessage(request);
+    } catch (error, stackTrace) {
+      _requestReplyQueue.closeWithError(error, stackTrace);
+      rethrow;
+    }
+    return await reply;
+  }
+
+  void _finish(Object error, [StackTrace? stackTrace]) {
+    _requestReplyQueue.closeWithError(error, stackTrace);
+    if (!_done.isCompleted) {
+      _done.complete();
+    }
   }
 
   void _handleWindowAdjustMessage(int bytesToAdd) {
@@ -260,7 +284,15 @@ class SSHChannelController {
       throw ArgumentError.value(bytesToAdd, 'bytesToAdd', 'must be positive');
     }
 
-    _remoteWindow += bytesToAdd;
+    final adjustedWindow = _remoteWindow + bytesToAdd;
+    if (adjustedWindow > _maxChannelWindow) {
+      throw SSHStateError(
+        'Remote window overflow on channel $localId: '
+        '$_remoteWindow + $bytesToAdd exceeds $_maxChannelWindow',
+      );
+    }
+
+    _remoteWindow = adjustedWindow;
 
     if (_remoteWindow > 0) {
       _uploadLoop.activate();
@@ -275,14 +307,53 @@ class SSHChannelController {
       return;
     }
 
-    _remoteStream.add(SSHChannelData(data, type: type));
-
-    _localWindow -= data.length;
-    if (_localWindow < 0) {
-      // Maybe we should close the channel here?
+    final dataKind = type == null ? 'data' : 'extended data';
+    if (data.length > localMaximumPacketSize) {
+      _failChannel(
+        'Channel $localId closed: the peer sent a $dataKind packet of '
+        '${data.length} bytes, over the maximum packet size of '
+        '$localMaximumPacketSize it was given',
+      );
+      return;
     }
 
+    if (data.length > _localWindow) {
+      _failChannel(
+        'Channel $localId closed: the peer sent a $dataKind packet of '
+        '${data.length} bytes, over the $_localWindow bytes left in the '
+        'window it was granted',
+      );
+      return;
+    }
+
+    _localWindow -= data.length;
+    _remoteStream.add(SSHChannelData(data, type: type));
     _sendWindowAdjustIfNeeded();
+  }
+
+  /// Tears down this channel after the peer violated the channel protocol,
+  /// leaving the SSH connection and its other channels untouched.
+  ///
+  /// The error is delivered to whoever is reading the channel, so a caller
+  /// waiting on an SFTP download or a shell stream finds out instead of
+  /// receiving a silently truncated result. OpenSSH logs and discards the
+  /// offending packet here, which is reasonable for an interactive client but
+  /// not for a library that hands the bytes to an application.
+  ///
+  /// Failing the whole connection is the other extreme: applications
+  /// multiplex a shell, SFTP and port forwards over a single connection, and
+  /// one peer miscounting a window on one channel should not take the rest
+  /// down with it.
+  void _failChannel(String message) {
+    printDebug?.call('SSHChannel._failChannel: $message');
+
+    if (!_remoteStream.isClosed) {
+      _remoteStream.addError(SSHStateError(message));
+    }
+
+    // Sends EOF and CHANNEL_CLOSE to the peer and completes [done]. The peer's
+    // CHANNEL_CLOSE reply is what removes the channel from the client.
+    destroy();
   }
 
   void _handleRequestMessage(SSH_Message_Channel_Request request) {
@@ -311,7 +382,7 @@ class SSHChannelController {
   void _handleCloseMessage() {
     printDebug?.call('SSHChannel._handleCLoseMessage');
     _remoteStream.close();
-    close();
+    unawaited(close());
   }
 
   bool _defaultRequestHandler(SSH_Message_Channel_Request request) {
@@ -323,7 +394,12 @@ class SSHChannelController {
     if (_done.isCompleted) return;
     if (_hasSentEOF) return;
     _hasSentEOF = true;
-    sendMessage(SSH_Message_Channel_EOF(recipientChannel: remoteId));
+
+    try {
+      sendMessage(SSH_Message_Channel_EOF(recipientChannel: remoteId));
+    } catch (e) {
+      printDebug?.call('SSHChannelController._sendEOFIfNeeded - error: $e');
+    }
   }
 
   void _sendCloseIfNeeded() {
@@ -354,9 +430,10 @@ class SSHChannelController {
 
     if (_done.isCompleted) return;
     if (_remoteStream.isPaused) return;
-    if (_localWindow <= 0) return;
 
     final bytesToAdd = localInitialWindowSize - _localWindow;
+    if (bytesToAdd <= 0) return;
+
     _localWindow = localInitialWindowSize;
 
     sendMessage(
@@ -408,8 +485,10 @@ class SSHChannelController {
     }
   });
 
-  Future<void> flush() async {
-    await onFlush?.call();
+  Future<void> flush() {
+    return _terminalState.bind(() async {
+      await onFlush?.call();
+    });
   }
 }
 
@@ -418,7 +497,7 @@ class SSHChannel {
   SSHChannelId get channelId => _controller.localId;
 
   /// The channel id on the remote side.
-  SSHChannelId get remoteChannelId => _controller.localId;
+  SSHChannelId get remoteChannelId => _controller.remoteId;
 
   /// The maximum packet size that the remote side can receive.
   int get maximumPacketSize => _controller.remoteMaximumPacketSize;

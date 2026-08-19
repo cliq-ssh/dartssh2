@@ -49,18 +49,37 @@ void main() {
       expect(SSHCipherType.aes128gcm.aeadTagSize, 16);
     });
 
-    test('AEAD ciphers do not expose BlockCipher API', () {
-      expect(
-        () => SSHCipherType.aes128gcm.createCipher(
-          Uint8List(SSHCipherType.aes128gcm.keySize),
-          Uint8List(SSHCipherType.aes128gcm.ivSize),
-          forEncryption: true,
-        ),
-        throwsA(isA<UnsupportedError>()),
-      );
+    test('OpenSSH ChaCha20-Poly1305 exposes packet-cipher metadata', () {
+      final cipher = SSHCipherType.chacha20poly1305;
+
+      expect(cipher.isAead, isTrue);
+      expect(cipher.keySize, 64);
+      expect(cipher.ivSize, 0);
+      expect(cipher.blockSize, 8);
+      expect(cipher.aeadTagSize, 16);
     });
 
-    test('fromName resolves AES-GCM ciphers', () {
+    test('AEAD ciphers do not expose BlockCipher API', () {
+      for (final cipher in [
+        SSHCipherType.chacha20poly1305,
+        SSHCipherType.aes128gcm,
+      ]) {
+        expect(
+          () => cipher.createCipher(
+            Uint8List(cipher.keySize),
+            Uint8List(cipher.ivSize),
+            forEncryption: true,
+          ),
+          throwsA(isA<UnsupportedError>()),
+        );
+      }
+    });
+
+    test('fromName resolves AEAD ciphers', () {
+      expect(
+        SSHCipherType.fromName('chacha20-poly1305@openssh.com'),
+        SSHCipherType.chacha20poly1305,
+      );
       expect(
         SSHCipherType.fromName('aes128-gcm@openssh.com'),
         SSHCipherType.aes128gcm,
@@ -114,7 +133,6 @@ void main() {
           SSHKexType.dh14Sha256,
           SSHKexType.dh14Sha1,
           SSHKexType.dhGexSha1,
-          SSHKexType.dh1Sha1,
         ]));
 
     expect(
@@ -123,33 +141,67 @@ void main() {
           SSHHostkeyType.ed25519,
           SSHHostkeyType.rsaSha512,
           SSHHostkeyType.rsaSha256,
-          SSHHostkeyType.rsaSha1,
           SSHHostkeyType.ecdsa521,
           SSHHostkeyType.ecdsa384,
           SSHHostkeyType.ecdsa256,
+          SSHHostkeyType.rsaSha1,
         ]));
 
     expect(
         algorithms.cipher,
         equals([
-          SSHCipherType.aes128ctr,
-          SSHCipherType.aes128cbc,
+          SSHCipherType.aes256gcm,
+          SSHCipherType.aes128gcm,
+          SSHCipherType.chacha20poly1305,
           SSHCipherType.aes256ctr,
+          SSHCipherType.aes128ctr,
           SSHCipherType.aes256cbc,
+          SSHCipherType.aes128cbc,
         ]));
 
     expect(
         algorithms.mac,
         equals([
-          SSHMacType.hmacSha256_96,
-          SSHMacType.hmacSha512_96,
           SSHMacType.hmacSha256Etm,
           SSHMacType.hmacSha512Etm,
-          SSHMacType.hmacSha1,
           SSHMacType.hmacSha256,
           SSHMacType.hmacSha512,
-          SSHMacType.hmacMd5,
+          SSHMacType.hmacSha1,
         ]));
+  });
+
+  group('Default algorithm preferences', () {
+    final algorithms = SSHAlgorithms();
+
+    test('prefer AEAD over CTR, and CTR over CBC', () {
+      final names = algorithms.cipher.toNameList();
+      final firstCbc = names.indexWhere((name) => name.endsWith('-cbc'));
+      final lastCtr = names.lastIndexWhere((name) => name.endsWith('-ctr'));
+      final lastGcm = names.lastIndexWhere((name) => name.contains('gcm'));
+
+      expect(lastGcm, lessThan(lastCtr));
+      expect(lastCtr, lessThan(firstCbc));
+    });
+
+    test('prefer encrypt-then-MAC over encrypt-and-MAC', () {
+      final macs = algorithms.mac;
+      final lastEtm = macs.lastIndexWhere((mac) => mac.isEtm);
+      final firstPlain = macs.indexWhere((mac) => !mac.isEtm);
+
+      expect(lastEtm, lessThan(firstPlain));
+    });
+
+    test('exclude broken algorithms', () {
+      expect(algorithms.mac, isNot(contains(SSHMacType.hmacMd5)));
+      expect(algorithms.mac, isNot(contains(SSHMacType.hmacSha256_96)));
+      expect(algorithms.mac, isNot(contains(SSHMacType.hmacSha512_96)));
+      expect(algorithms.kex, isNot(contains(SSHKexType.dh1Sha1)));
+    });
+
+    test('keep SHA-1 based algorithms last as a fallback', () {
+      expect(algorithms.mac.last, SSHMacType.hmacSha1);
+      expect(algorithms.hostkey.last, SSHHostkeyType.rsaSha1);
+    });
   });
 }
 

@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:dartssh2/src/message/msg_channel.dart';
 import 'package:dartssh2/src/ssh_channel.dart';
+import 'package:dartssh2/src/ssh_message.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -147,6 +148,57 @@ void main() {
       client.close();
     });
 
+    test('propagates stdout stream errors', () async {
+      final error = StateError('stdout failed');
+      final harness = _SessionHarness(stdoutError: error);
+      final client = _TestSSHClient(() async {
+        scheduleMicrotask(harness.close);
+        return harness.session;
+      });
+
+      await expectLater(
+        client.runWithResult('cmd').timeout(const Duration(seconds: 1)),
+        throwsA(same(error)),
+      );
+
+      harness.dispose();
+      client.close();
+    });
+
+    test('propagates stderr stream errors while stdout is open', () async {
+      final error = StateError('stderr failed');
+      final harness = _SessionHarness(stderrError: error);
+      final client = _TestSSHClient(() async => harness.session);
+
+      await expectLater(
+        client.runWithResult('cmd').timeout(const Duration(seconds: 1)),
+        throwsA(same(error)),
+      );
+
+      harness.dispose();
+      client.close();
+    });
+
+    test('tears down the session when a stream fails', () async {
+      final error = StateError('stdout failed');
+      final harness = _SessionHarness(stdoutError: error);
+      final client = _TestSSHClient(() async => harness.session);
+
+      await expectLater(
+        client.runWithResult('cmd').timeout(const Duration(seconds: 1)),
+        throwsA(same(error)),
+      );
+
+      expect(
+        harness.sentMessages.whereType<SSH_Message_Channel_EOF>(),
+        isNotEmpty,
+        reason: 'the session must be torn down instead of leaking the channel',
+      );
+
+      harness.dispose();
+      client.close();
+    });
+
     test('run() returns combined output bytes', () async {
       final harness = _SessionHarness();
       final client = _TestSSHClient(() async {
@@ -190,7 +242,7 @@ class _TestSSHClient extends SSHClient {
 }
 
 class _SessionHarness {
-  _SessionHarness() {
+  _SessionHarness({Object? stdoutError, Object? stderrError}) {
     _controller = SSHChannelController(
       localId: 1,
       localMaximumPacketSize: 1024 * 1024,
@@ -198,10 +250,18 @@ class _SessionHarness {
       remoteId: 2,
       remoteMaximumPacketSize: 1024 * 1024,
       remoteInitialWindowSize: 1024 * 1024,
-      sendMessage: (_) {},
+      sendMessage: sentMessages.add,
     );
-    session = SSHSession(_controller.channel);
+    session = stdoutError == null && stderrError == null
+        ? SSHSession(_controller.channel)
+        : _FailingStreamSSHSession(
+            _controller.channel,
+            stdoutError: stdoutError,
+            stderrError: stderrError,
+          );
   }
+
+  final sentMessages = <SSHMessage>[];
 
   late final SSHChannelController _controller;
   late final SSHSession session;
@@ -253,6 +313,30 @@ class _SessionHarness {
 
   void dispose() {
     _controller.destroy();
+  }
+}
+
+class _FailingStreamSSHSession extends SSHSession {
+  _FailingStreamSSHSession(
+    super.channel, {
+    Object? stdoutError,
+    Object? stderrError,
+  })  : _stdoutError = stdoutError,
+        _stderrError = stderrError;
+
+  final Object? _stdoutError;
+  final Object? _stderrError;
+
+  @override
+  Stream<Uint8List> get stdout {
+    final error = _stdoutError;
+    return error == null ? super.stdout : Stream<Uint8List>.error(error);
+  }
+
+  @override
+  Stream<Uint8List> get stderr {
+    final error = _stderrError;
+    return error == null ? super.stderr : Stream<Uint8List>.error(error);
   }
 }
 

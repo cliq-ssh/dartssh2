@@ -1,5 +1,16 @@
 part of 'sftp_client.dart';
 
+/// A large sentinel length used by [SftpFile.read] when the file's reported
+/// size cannot be trusted as a real byte count (see the comment where it's
+/// used). Reads keep pipelining up to this many bytes, but in practice the
+/// loop always terminates earlier via the server's SSH_FX_EOF status.
+///
+/// Written as a decimal literal on purpose. `1 << 40` folds to `0` under
+/// dart2js, whose shifts are 32-bit, which would send every virtual file
+/// straight back down the `length == 0` early return this constant exists to
+/// avoid.
+const _kUnboundedReadLength = 1099511627776; // 1 TiB
+
 /// Represents an opened file handle on the remote SFTP server.
 class SftpFile {
   final Uint8List _handle;
@@ -72,6 +83,28 @@ class SftpFile {
       }
 
       length = fileSize - offset;
+
+      // Some filesystems report a size of 0 for files that actually
+      // contain data (e.g. Linux /proc entries, character/device files).
+      // SFTP signals end-of-file via the SSH_FX_EOF status code, not via
+      // the reported size, so don't trust a stat()-derived size of 0 as
+      // "nothing to read". Fall back to reading until the server tells us
+      // we've hit EOF. A genuinely empty file still terminates promptly:
+      // the very first read request comes back as EOF immediately. This
+      // only applies when we computed `length` ourselves - a caller who
+      // explicitly passes `length: 0` still gets an empty stream below.
+      if (length == 0) {
+        length = _kUnboundedReadLength;
+        // The read-ahead pipelining below assumes `length` reflects the
+        // real amount of remaining data, and will happily keep opening
+        // more concurrent requests as long as `reservedOffset` is short of
+        // `endOffset`. With a sentinel `endOffset` that's effectively
+        // unbounded, so force strictly sequential requests here - we don't
+        // know where the real EOF is, and we'd rather send one request at
+        // a time than fan out up to [maxPendingRequests] speculative reads
+        // into a file that may only be a few bytes long.
+        maxPendingRequests = 1;
+      }
     }
 
     if (length == 0) return;
@@ -119,7 +152,7 @@ class SftpFile {
 
     void issueRead(int startOffset, int requestLength) {
       pendingReadCount++;
-      _readChunk(requestLength, startOffset).then(
+      readChunk(requestLength, startOffset).then(
         (chunk) {
           pendingReadCount--;
 
@@ -268,162 +301,6 @@ class SftpFile {
     return bytesRead;
   }
 
-  /// Downloads this file into a random-access local file.
-  ///
-  /// Unlike [read] and [downloadTo], this method does not require SFTP read
-  /// replies to be yielded in offset order. Replies are written to
-  /// [destination] at the same offset, allowing pipelined reads to make
-  /// progress even when later offsets complete before earlier ones.
-  ///
-  /// Returns the total number of bytes written.
-  Future<int> downloadToRandomAccess(
-    RandomAccessFile destination, {
-    int? length,
-    int offset = 0,
-    void Function(int bytesRead)? onProgress,
-    int chunkSize = _kDownloadChunkSize,
-    int maxPendingRequests = _kDownloadMaxPendingRequests,
-  }) async {
-    _mustNotBeClosed();
-    if (chunkSize <= 0) {
-      throw ArgumentError.value(chunkSize, 'chunkSize', 'must be positive');
-    }
-    if (maxPendingRequests <= 0) {
-      throw ArgumentError.value(
-        maxPendingRequests,
-        'maxPendingRequests',
-        'must be positive',
-      );
-    }
-
-    if (length == null) {
-      final fileSize = (await stat()).size;
-      if (fileSize == null) {
-        throw SftpError('Can not get file size');
-      }
-      length = fileSize - offset;
-    }
-
-    if (length == 0) return 0;
-    if (length < 0) {
-      throw SftpError('Length must be positive: $length');
-    }
-
-    final endOffset = offset + length;
-    final completionQueue = <_ReadCompletion>[];
-    var reservedOffset = offset;
-    var bytesWritten = 0;
-    var pendingReadCount = 0;
-    var activeReadLimit = 1;
-    var effectiveChunkSize = chunkSize;
-    Object? pendingError;
-    StackTrace? pendingStackTrace;
-    Completer<void>? completionSignal;
-
-    void notifyReadComplete() {
-      final signal = completionSignal;
-      if (signal != null && !signal.isCompleted) {
-        signal.complete();
-      }
-    }
-
-    Future<void> waitForReadComplete() {
-      if (completionQueue.isNotEmpty || pendingError != null) {
-        return Future.value();
-      }
-      final signal = completionSignal = Completer<void>();
-      return signal.future.whenComplete(() {
-        if (identical(completionSignal, signal)) {
-          completionSignal = null;
-        }
-      });
-    }
-
-    void issueRead(int startOffset, int requestLength) {
-      pendingReadCount++;
-      _readChunk(requestLength, startOffset).then(
-        (chunk) {
-          pendingReadCount--;
-          if (chunk != null && chunk.isNotEmpty) {
-            activeReadLimit = min(maxPendingRequests, activeReadLimit + 1);
-          }
-          completionQueue.add(_ReadCompletion(startOffset, chunk));
-          if (chunk != null &&
-              chunk.isNotEmpty &&
-              chunk.length < requestLength &&
-              startOffset + chunk.length < endOffset) {
-            effectiveChunkSize = max(1, min(effectiveChunkSize, chunk.length));
-            issueRead(
-              startOffset + chunk.length,
-              min(
-                requestLength - chunk.length,
-                endOffset - startOffset - chunk.length,
-              ),
-            );
-          }
-          notifyReadComplete();
-        },
-        onError: (Object error, StackTrace stackTrace) {
-          pendingReadCount--;
-          pendingError = error;
-          pendingStackTrace = stackTrace;
-          notifyReadComplete();
-        },
-      );
-    }
-
-    void scheduleReads() {
-      while (reservedOffset < endOffset && pendingReadCount < activeReadLimit) {
-        final startOffset = reservedOffset;
-        final requestLength =
-            min(effectiveChunkSize, endOffset - reservedOffset);
-        issueRead(startOffset, requestLength);
-        reservedOffset += requestLength;
-      }
-    }
-
-    scheduleReads();
-
-    while (bytesWritten < length) {
-      if (pendingError != null) {
-        Error.throwWithStackTrace(pendingError!, pendingStackTrace!);
-      }
-
-      if (completionQueue.isEmpty) {
-        if (pendingReadCount == 0) break;
-        await waitForReadComplete();
-        continue;
-      }
-
-      final completion = completionQueue.removeAt(0);
-      final startOffset = completion.startOffset;
-      final chunk = completion.chunk;
-      if (chunk == null) break;
-      if (chunk.isEmpty) {
-        throw SftpError('Unexpected empty data chunk before EOF');
-      }
-
-      final remaining = length - (startOffset - offset);
-      final outputChunk = chunk.length <= remaining
-          ? chunk
-          : Uint8List.sublistView(chunk, 0, remaining);
-      await destination.setPosition(startOffset);
-      await destination.writeFrom(outputChunk);
-
-      bytesWritten += outputChunk.length;
-      onProgress?.call(bytesWritten);
-      scheduleReads();
-    }
-
-    if (bytesWritten != length) {
-      throw SftpError(
-        'Incomplete download: received $bytesWritten of $length bytes',
-      );
-    }
-
-    return bytesWritten;
-  }
-
   /// Reads at most [length] bytes from the file starting at [offset]. If
   /// [length] is null, reads until end of the file.
   /// Use [read] if you want to stream large file in chunks.
@@ -438,30 +315,97 @@ class SftpFile {
   /// Writes [stream] to the file starting at [offset].
   ///
   /// Returns a [SftpFileWriter] that can be used to control the write
-  /// operation or wait for it to complete.
+  /// operation or wait for it to complete. [chunkSize] controls individual
+  /// WRITE packet sizes and [maxPendingRequests] bounds the number waiting for
+  /// acknowledgement.
   SftpFileWriter write(
     Stream<Uint8List> stream, {
     int offset = 0,
     void Function(int total)? onProgress,
+    int chunkSize = defaultChunkSize,
+    int maxPendingRequests = defaultMaxPendingRequests,
   }) {
-    return SftpFileWriter(this, stream, offset, onProgress);
+    return SftpFileWriter(
+      this,
+      stream,
+      offset,
+      onProgress,
+      chunkSize: chunkSize,
+      maxPendingRequests: maxPendingRequests,
+    );
   }
 
   /// Writes [data] to the file starting at [offset].
-  Future<void> writeBytes(Uint8List data, {int offset = 0}) async {
+  ///
+  /// At most [maxPendingRequests] writes are sent without an acknowledgement.
+  /// If a write fails, no new requests are sent and all requests already in
+  /// flight are drained before the first error is reported.
+  Future<void> writeBytes(
+    Uint8List data, {
+    int offset = 0,
+    int chunkSize = defaultChunkSize,
+    int maxPendingRequests = defaultMaxPendingRequests,
+  }) async {
     _mustNotBeClosed();
-    const maxChunkSize = 16 * 1024;
-    var bytesSent = 0;
-    final futures = <Future<void>>[];
-    while (bytesSent < data.length) {
-      final chunkSize = min(data.length - bytesSent, maxChunkSize);
-      final chunkBegin = bytesSent;
-      final chunkEnd = chunkBegin + chunkSize;
-      final chunk = Uint8List.sublistView(data, chunkBegin, chunkEnd);
-      futures.add(_writeChunk(chunk, offset: offset + bytesSent));
-      bytesSent += chunkSize;
+    if (offset < 0) {
+      throw ArgumentError.value(offset, 'offset', 'must not be negative');
     }
-    await Future.wait(futures);
+    if (chunkSize <= 0) {
+      throw ArgumentError.value(chunkSize, 'chunkSize', 'must be positive');
+    }
+    if (maxPendingRequests <= 0) {
+      throw ArgumentError.value(
+        maxPendingRequests,
+        'maxPendingRequests',
+        'must be positive',
+      );
+    }
+
+    var bytesScheduled = 0;
+    var nextWriteId = 0;
+    final pending = <int, Future<_WriteCompletion>>{};
+    Object? firstError;
+    StackTrace? firstErrorStackTrace;
+
+    void scheduleWrite() {
+      final writeId = nextWriteId++;
+      final length = min(chunkSize, data.length - bytesScheduled);
+      final chunk = Uint8List.sublistView(
+        data,
+        bytesScheduled,
+        bytesScheduled + length,
+      );
+      final writeOffset = offset + bytesScheduled;
+      bytesScheduled += length;
+
+      pending[writeId] = _writeChunk(chunk, offset: writeOffset).then(
+        (_) => _WriteCompletion(writeId),
+        onError: (Object error, StackTrace stackTrace) {
+          firstError ??= error;
+          firstErrorStackTrace ??= stackTrace;
+          return _WriteCompletion(writeId);
+        },
+      );
+    }
+
+    while (bytesScheduled < data.length && firstError == null) {
+      while (
+          bytesScheduled < data.length && pending.length < maxPendingRequests) {
+        scheduleWrite();
+      }
+
+      final completed = await Future.any(pending.values);
+      pending.remove(completed.id);
+    }
+
+    while (pending.isNotEmpty) {
+      final completed = await Future.any(pending.values);
+      pending.remove(completed.id);
+    }
+
+    if (firstError != null) {
+      Error.throwWithStackTrace(firstError!, firstErrorStackTrace!);
+    }
   }
 
   /// Gets filesystem statistics that this file is on.
@@ -493,7 +437,14 @@ class SftpFile {
     SftpStatusError.check(reply);
   }
 
-  Future<Uint8List?> _readChunk(int length, [int offset = 0]) async {
+  /// Reads one chunk from the remote file.
+  ///
+  /// The single seam [SftpFileDownload.downloadToRandomAccess] needs. It lives
+  /// in its own library so that naming `dart:io`'s [RandomAccessFile] does not
+  /// pull `dart:io` into this one, which is what kept pub.dev from listing the
+  /// package as available on the web.
+  @internal
+  Future<Uint8List?> readChunk(int length, [int offset = 0]) async {
     _mustNotBeClosed();
     final reply = await _client._sendRead(_handle, offset, length);
     if (reply is SftpDataPacket) return reply.data;
@@ -526,9 +477,8 @@ class SftpHandsake {
 }
 
 /// Tracks a pending SFTP read completion for [SftpFile.downloadToRandomAccess].
-class _ReadCompletion {
-  _ReadCompletion(this.startOffset, this.chunk);
+class _WriteCompletion {
+  _WriteCompletion(this.id);
 
-  final int startOffset;
-  final Uint8List? chunk;
+  final int id;
 }

@@ -1,3 +1,53 @@
+## [4.1.0] - 2026-09-04
+- Added `SSHClient.pipelineChannelRequests`, off by default, which sends all of a session's channel requests before reading any reply instead of waiting for each one in turn. `execute` and `shell` send `env`, agent forwarding, `pty-req` and `x11-req` ahead of `exec` or `shell`, and each of them cost a round trip: against a server 40 ms away, `execute` with a pty measured 246 ms before and 206 ms after. RFC 4254 §5.4 permits sending further messages without waiting and §4 requires the peer to answer a channel's requests in the order it received them, which is what `ssh(1)` relies on when it does the same thing. Setting it also adopts OpenSSH's reporting, because it has to: the command is on the wire before a refusal can come back, so a refused `pty-req`, `env`, agent forwarding or `x11-req` is reported through `printDebug` and the command runs, the way `ssh(1)` prints `PTY allocation request failed on channel 0` and carries on, rather than throwing an error that means the command has already run. Only a refused `exec` or `shell` still throws `SSHChannelRequestError`, because nothing has run when that one fails. Leaving it unset changes nothing, down to the order the requests go out and the message of every error [#243].
+- Added a `dartssh2-nopty` account to the interop server, which `PermitTTY no` applies to, so both sides of a refused `pty-req` are exercised against a real OpenSSH: by default the command does not run, and with pipelining it does [#243].
+- Fixed the package reading as web-incompatible on pub.dev. `SftpFile.downloadToRandomAccess` takes a `dart:io` `RandomAccessFile`, and naming that type from the SFTP library was enough for pub.dev to drop `platform:web` from the whole package, which also keeps it out of any search filtered to web. Everything else already compiled and ran there, and 4.0.0 made the ciphers and SFTP work. The method moves to an `SftpFileDownload` extension in its own library, exported conditionally the way `SSHSocket` and dynamic forwarding already are, so nothing changes for a caller on the VM: same import, same call. On the web the extension is simply absent, as is the `RandomAccessFile` it would need. Confirmed with pana, the tool pub.dev scores with: `platform:web` is present after and absent before [#248].
+- Added browser interop tests, so "web is supported" is something CI checks rather than something the pieces individually suggest. Everything that ran under `-p chrome` until now proved the AEAD arithmetic, the SFTP encoding and the HTTP parsing compile and behave, and none of it put a packet on a wire, which is the gap that let every AEAD cipher and the whole of SFTP sit broken on the web until 4.0.0. The new tests run the browser against the same OpenSSH server the VM interop tests use, through `tool/ws_bridge.dart`, and cover a handshake, a command, an `aes256-gcm` session and an SFTP round trip. The `SSHSocket` they connect through is the WebSocket one the README tells web users to write, so it doubles as a worked example [#248].
+
+## [4.0.1] - 2026-09-03
+- Fixed a channel stalling permanently when data arrived before the application subscribed to it. `StreamController.isPaused` is true until something listens, which suppressed every `SSH_MSG_CHANNEL_WINDOW_ADJUST`, and Dart delivers the first subscription as `onListen` rather than `onResume` — the only hook wired — so a peer that legally filled the advertised window in that gap was left at zero credit with no further data able to arrive and trigger a grant. Reproduced at the client's own sizes with 64 packets of 32 KiB into a 2 MiB window, before and after the first listener and through `.map()`, in every case zero adjustments. The remote forwarding example in the README reaches it: it awaits `Socket.connect()` for each connection before subscribing, and the forwarded channel is created with no listener attached [#244].
+- Changed the receive window to be granted back once half of it has been consumed rather than after every data packet. Any consumed byte made the outstanding grant positive, so each `SSH_MSG_CHANNEL_DATA` was answered with a window adjust of its own, and the smaller the packets the closer the uplink packet count got to the downlink one: counted on `SSHChannelController`, 256 inbound packets of 32 KiB produced 256 adjustments, and 4096 of 64 B produced 4096. They now produce 8 and 0. This is one of the two rules OpenSSH applies in `channels.c`, which refills at half the window or once `local_window_max - local_window > local_maxpacket * 3`, whichever comes first. Only the first is implemented here, so at a 2 MiB window with 32 KiB packets this defers further than OpenSSH would, thirty-two packets against its three or four, which is the point of the change. The threshold never defers past one maximum packet of remaining credit, so a window smaller than twice the packet size cannot leave a conforming peer holding a chunk it may neither send nor is obliged to split. Pausing the stream still suppresses the grant, which is the documented backpressure mechanism [#244].
+
+## [4.0.0] - 2026-08-31
+- **Breaking change.** Removed the legacy algorithms from the default proposals, leaving them implemented but off unless asked for: the SHA-1 key exchange methods `diffie-hellman-group14-sha1` and `diffie-hellman-group-exchange-sha1`, the `ssh-rsa` host key signature, and the `aes256-cbc` and `aes128-cbc` ciphers. This matches what OpenSSH proposes in `myproposal.h`, which drops all of them and keeps only `hmac-sha1` at the end of the MAC list, as this does. `ssh-rsa` signs host keys with SHA-1 and is open to chosen-prefix collisions, which is why OpenSSH disabled it by default in 8.8, and CBC in SSH is vulnerable to the plaintext recovery of CVE-2008-5161. A server that offers nothing but these will now fail to negotiate rather than connect weakly, which for older routers, NAS boxes and embedded servers is a real change: pass the algorithm through `SSHAlgorithms` to keep talking to it [#236]. Thanks [@GT-610].
+- Changed SFTP uploads to pipeline a bounded number of outstanding write requests, 64 by default, matching OpenSSH's `DEFAULT_NUM_REQUESTS`. Writes were issued and awaited one at a time, so every chunk cost a full round trip and a high latency link spent most of its time idle. Acknowledgements are now accepted out of order without resubmitting an offset, and offsets are still assigned in stream order so concurrent writes cannot overlap. `SftpFile.write` and `SftpFileWriter` take `chunkSize` and `maxPendingRequests`, and reject a negative offset or a non-positive setting rather than misbehaving later [#237]. Thanks [@GT-610].
+- Changed a failing SFTP upload to stop scheduling new writes, drain the ones already in flight and report the first error through the returned future, instead of surfacing whichever error happened to arrive last. This supersedes the narrower `SftpFileWriter` error handling added in #230, whose regression tests all still pass [#237].
+- Deprecated `chunkSize` in favour of `defaultChunkSize`, and `maxBytesOnTheWire`, which nothing reads any more now that uploads are bounded by request count rather than by a byte window [#237].
+- Changed `ChunkBuffer` to grow by reallocating with headroom instead of copying the whole buffer on every append, making `add()` amortised O(1) rather than O(n). Accumulating 64 MB in 8 KiB chunks without draining, which is what a burst of packets arriving faster than they are consumed looks like, drops from about 185 seconds to about 72 milliseconds. The steady drained case costs about 25% more, roughly 162 ms to 202 ms over 20k packets of 32 KiB, because `consume()` now returns a copy rather than an alias into a buffer a later `add()` may reallocate; both figures are around 3 GB/s, so neither is visible next to a network [#231].
+- Removed the dead `MinChunkSize` stream transformer and two stale markers in `ssh_mac_type.dart`, neither of which anything referenced [#231].
+- Removed the legacy analyzer plugin entry from `analysis_options.yaml`. Dart 3.13.2 warns on it and `dart analyze` exits non-zero on a warning, so every job on every branch started failing with nothing in the code having changed. It was dead configuration in any case: `dart_code_metrics_presets` ships preset YAML meant for `include:`, no analyzer plugin, so nothing was ever loaded through it. The now unused dev dependency went with it [#232] [#233].
+- Scoped the encrypted key tests to the VM. They use `dart:io` for their `ssh-keygen` interoperability checks, which the web job cannot load [#239].
+- **Breaking change.** `SftpFileAttrs` now drops a `uidgid` or `acmodtime` pair when only one half of it is set, instead of writing the flag with a single value. The pair is two fields under one flag in the SFTP wire format, so a half-filled one produced a packet the server misparsed, applying the wrong ownership or timestamps. Anyone calling `setStat` with only `modifyTime` set will find the value is now ignored rather than sent alongside a garbage access time; set both to change either [#230]. Thanks [@klc].
+- **Breaking change.** A host key that changes during a rekey now terminates the connection with `SSHHostkeyError`, as OpenSSH does. The signature was already re-checked on every exchange, but that only proved the key presented was self-consistent, not that it was the key `onVerifyHostKey` had already approved, so a server could hand out one key at connect time and a different one on the first rekey. A connection that used to survive this will now drop. `onVerifyHostKey` is consulted once per connection, not once per exchange [#229]. Thanks [@klc].
+- Fixed the version exchange failing when the banner arrives split across TCP segments or WebSocket frames. It was treated as a framing error rather than a partial read, which made the WebSocket transport the README recommends for web unreliable by construction, and any slow or proxied connection intermittently so. Lines of text sent before the identification line are also skipped now, which RFC 4253 §4.2 says clients MUST be able to process; at most 1024 of them, matching OpenSSH, so a server streaming them forever cannot keep a client busy [#229].
+- Fixed `keyboard-interactive` responses being written to the trace log in plaintext, which put the user's password in any log a caller collected with `printTrace` set [#229].
+- Changed MAC comparison to constant time, and removed both the received and the expected MAC from the failure message [#229].
+- Fixed three of the four packet send paths using a fixed padding pattern instead of random bytes, contrary to RFC 4253 §6 [#229].
+- Added validation of the peer's public value in every key exchange. Finite field Diffie-Hellman now requires `1 < f < p - 1`, the NIST curves reject points that fail to decode, lie off the curve or are the point at infinity, and X25519 rejects small-order points via the RFC 8731 §3 all-zero shared secret check and requires the key to be exactly 32 bytes. Without these a peer could force a shared secret it knew in advance [#229].
+- Added the missing lower bound and AEAD path checks to packet length validation, and made a zero-length payload raise `SSHPacketError` instead of a `RangeError` that no `SSHError` handler would catch [#229].
+- Changed the non-ETM receive path to verify the MAC before parsing the padding, so a forged packet is rejected before its length fields are trusted [#229].
+- Fixed the non-ETM receive path accepting a packet whose encrypted length is not a multiple of the cipher block size. The decrypt loop pulled whole blocks until it had enough, so an unaligned length made it read past the ciphertext and on into the MAC, and the `RangeError` that followed was not an `SSHError` any handler would catch. The length is now rejected up front, as OpenSSH does in `ssh_packet_read_poll2()`, and the remaining ciphertext is decrypted in one pass instead of a block at a time [#234]. Thanks [@GT-610].
+- Fixed `SSH_MSG_KEX_ECDH_REPLY` being encoded with its fields in the wrong order. RFC 5656 §4 specifies `K_S, Q_S, signature`, which is what this library's own decoder already expected, so only a peer decoding what dartssh2 sent as a server was affected [#229].
+- Fixed `writeMpint(BigInt.zero)` emitting `00 00 00 01 00` where RFC 4251 §5 requires a zero-length string, and `readNameList` returning `['']` for an empty name-list [#229].
+- Documented that leaving `onVerifyHostKey` null accepts any host key, which makes the connection trivially interceptable. The parameter is optional and the behaviour was not stated anywhere [#229].
+- Added encrypted OpenSSH private-key writing. `OpenSSHKeyPair.toPem()` takes an optional `passphrase`, and a non-empty one encrypts the private section with `aes256-ctr` keyed by `bcrypt_pbkdf`, following what `sshkey_private_to_blob2()` writes: a 16-byte salt, 24 rounds, key and IV derived together in one call, the check integer written twice and the block padded with 1, 2, 3 and so on. A null or empty passphrase still writes the unencrypted form. `OpenSSHKeyPairs.encrypted` builds the container directly for callers that need it. The `SSHKeyPair` interface is unchanged, so the new arguments are reachable only through `OpenSSHKeyPair` [#235]. Thanks [@GT-610].
+- Fixed a failing bcrypt KDF being ignored when reading an encrypted OpenSSH key. `bcrypt_pbkdf` reports invalid parameters through its return value, which was discarded, so a key with a zero round count or an empty salt carried on with an underived key and failed later as a check-integer mismatch. It now raises `SSHKeyDecryptError` at the point the KDF fails [#235]. Thanks [@GT-610].
+- Added `SSHClient.rekey()`, which starts a new key exchange on an established connection and returns a `Future<void>` completing once the new keys are in effect, so a caller rekeying between transfers can await it instead of watching `done`. If an exchange is already running, whether this side or the server started it, no second one is sent and the future tracks the one in flight; if the connection ends first the future carries the error that ended it. `SSHTransport.rekey()` was already public and returns the same future now, where it used to return `void` [#229].
+- Fixed every AEAD cipher and the whole of SFTP being dead on the web. `ByteData.getUint64` and `setUint64` throw `Unsupported operation: Uint64 accessor not supported by dart2js`, and four call sites went through them: the message reader, the int helper, the AES-GCM nonce and the ChaCha20-Poly1305 nonce. Since `aes256-gcm@openssh.com` sits first in the default cipher list, a browser connection died at the first encrypted packet even with a correct custom `SSHSocket`. Each now reads and writes two 32-bit words instead, bit-for-bit identical on the VM; compiled to JS a value needing more than 53 bits raises `UnsupportedError` rather than silently rounding, since these back SFTP file sizes and offsets [#230].
+- Added a `test-web` CI job running `dart test -p chrome`, with `@TestOn` markers on the suites that genuinely need the VM. Nothing ran against dart2js before, which is how the above went unnoticed while the README listed web as supported [#230].
+- Fixed virtual files such as those under `/proc` and `/dev` being handed back as empty. They report a stat size of 0 while still returning data, and `read`, `downloadTo` and `downloadToRandomAccess` all trusted the reported size and returned before issuing a read. Reads are now EOF-driven when the size cannot be trusted [#230].
+- Fixed `SftpFileWriter` hanging forever when the local stream raised. Errors had no handler and `_handleLocalDone` completed the done future unguarded, so a failing upload never returned and could also double-complete [#230].
+- Fixed an HTTP response body being discarded when the server sends no `Content-Length`. The body was read only up to a length that stayed 0, so whether it survived depended on TCP segment boundaries [#230].
+- Fixed `HttpHeaders.host` and `HttpHeaders.port` returning null for a perfectly valid `Host` header [#230].
+- Fixed a response that carries no body being read until the peer closes the connection. A 1xx, 204 or 304 response, and any response to `HEAD`, has no body whatever its framing headers say, so a server that keeps the connection open after sending one left the read waiting for bytes that were never coming. This was the sharp edge of reading unframed bodies to end of stream, added above [#230].
+- Added `SSHHttpClient.idleTimeout`, which bounds the wait between two pieces of a response. A body delimited by connection close still has to be read to end of stream, and nothing else in the client bounded that, so a peer that stopped sending without closing could hang a request indefinitely. It is an inactivity timeout rather than a deadline for the whole response, so a large body that keeps arriving is never cut short; leaving it null keeps the unbounded behaviour [#230].
+- Added overflow protection to the SFTP request id counter [#230].
+
+## [3.3.1] - 2026-08-19
+- Removed the background isolate offload from X25519 and NIST curve key exchange, which cost more than the work it was hiding. Generating an ephemeral key or computing the shared secret on these curves is one fixed-size scalar multiply, well under a millisecond, while `Isolate.run` takes several times that to spawn and tear down, and a client pays it twice per handshake. On a memory constrained Android device the spawn delay was long enough for the server to time out the key exchange and close the connection before `SSH_MSG_NEWKEYS` went out, surfacing as `SSHAuthAbortError` with a null reason [#226]. Thanks [@cesarcamps].
+- Kept the offload for finite field Diffie-Hellman, which is the one exchange whose cost the peer controls: group exchange lets the server name a modulus of up to 8192 bits, and modular exponentiation grows steeply with it.
+- Added debug logging around host key signature verification and the `onVerifyHostKey` callback. Everything between receiving the key exchange reply and sending `SSH_MSG_NEWKEYS` used to run without a single `printDebug` call, so a slow user callback and a slow shared secret were indistinguishable in a trace, and both looked like a hung handshake [#226].
+
 ## [3.3.0] - 2026-08-18
 - Added `SSHDisconnectError`, so the reason the peer gave for terminating the connection reaches the caller. `SSH_MSG_DISCONNECT` carries a reason code and a description, which is where OpenSSH puts lines such as "no matching key exchange method found"; the transport used to log it and close cleanly, leaving an unexplained disconnection [#224].
 - Fixed `SSHMessageReader.readBytes()` indexing the underlying buffer instead of the message, so it returned the wrong bytes whenever the message was a view into a larger buffer, which is what every SSH and SFTP payload is. Only OpenSSH private key decoding called it, on a freshly decoded blob where the two coincide, so nothing was broken in practice [#223].
@@ -303,43 +353,56 @@
 
 - Initial release.
 
-[#165]: https://github.com/vicajilau/dartssh2/issues/165
-[#141]: https://github.com/vicajilau/dartssh2/pull/141
-[#140]: https://github.com/vicajilau/dartssh2/pull/140
-[#145]: https://github.com/vicajilau/dartssh2/pull/145
-[#153]: https://github.com/vicajilau/dartssh2/pull/153
-[#157]: https://github.com/vicajilau/dartssh2/pull/157
-[#102]: https://github.com/vicajilau/dartssh2/issues/102
-[#99]: https://github.com/vicajilau/dartssh2/issues/99
-[#109]: https://github.com/vicajilau/dartssh2/issues/109
-[#121]: https://github.com/vicajilau/dartssh2/issues/121
-[#124]: https://github.com/vicajilau/dartssh2/issues/124
-[#95]: https://github.com/vicajilau/dartssh2/issues/95
-[#88]: https://github.com/vicajilau/dartssh2/issues/88
+[#1]: https://github.com/TerminalStudio/dartssh/pull/1/files
+[#14]: https://github.com/vicajilau/dartssh2/pull/14
+[#17]: https://github.com/vicajilau/dartssh2/issues/17
+[#18]: https://github.com/vicajilau/dartssh2/issues/18
+[#21]: https://github.com/vicajilau/dartssh2/issues/21
+[#23]: https://github.com/vicajilau/dartssh2/issues/23
+[#24]: https://github.com/vicajilau/dartssh2/issues/24
 [#26]: https://github.com/vicajilau/dartssh2/issues/26
-[#139]: https://github.com/vicajilau/dartssh2/pull/139
+[#50]: https://github.com/vicajilau/dartssh2/issues/50
+[#71]: https://github.com/vicajilau/dartssh2/issues/71
+[#80]: https://github.com/vicajilau/dartssh2/issues/80
+[#88]: https://github.com/vicajilau/dartssh2/issues/88
+[#95]: https://github.com/vicajilau/dartssh2/issues/95
+[#99]: https://github.com/vicajilau/dartssh2/issues/99
+[#100]: https://github.com/vicajilau/dartssh2/issues/100
+[#101]: https://github.com/vicajilau/dartssh2/pull/101
+[#102]: https://github.com/vicajilau/dartssh2/issues/102
+[#109]: https://github.com/vicajilau/dartssh2/issues/109
+[#115]: https://github.com/vicajilau/dartssh2/pull/115
+[#116]: https://github.com/vicajilau/dartssh2/issues/116
+[#121]: https://github.com/vicajilau/dartssh2/issues/121
+[#123]: https://github.com/vicajilau/dartssh2/pull/123
+[#124]: https://github.com/vicajilau/dartssh2/issues/124
+[#125]: https://github.com/vicajilau/dartssh2/pull/125
+[#126]: https://github.com/vicajilau/dartssh2/pull/126
+[#127]: https://github.com/vicajilau/dartssh2/pull/127
+[#131]: https://github.com/vicajilau/dartssh2/pull/131
 [#132]: https://github.com/vicajilau/dartssh2/pull/132
 [#133]: https://github.com/vicajilau/dartssh2/pull/133
 [#135]: https://github.com/vicajilau/dartssh2/pull/135
-[#131]: https://github.com/vicajilau/dartssh2/pull/131
-[#127]: https://github.com/vicajilau/dartssh2/pull/127
-[#126]: https://github.com/vicajilau/dartssh2/pull/126
-[#125]: https://github.com/vicajilau/dartssh2/pull/125
-[#123]: https://github.com/vicajilau/dartssh2/pull/123
-[#101]: https://github.com/vicajilau/dartssh2/pull/101
-[#100]: https://github.com/vicajilau/dartssh2/issues/100
-[#80]: https://github.com/vicajilau/dartssh2/issues/80
-[#71]: https://github.com/vicajilau/dartssh2/issues/71
-[#50]: https://github.com/vicajilau/dartssh2/issues/50
-[#24]: https://github.com/vicajilau/dartssh2/issues/24
-[#23]: https://github.com/vicajilau/dartssh2/issues/23
-[#21]: https://github.com/vicajilau/dartssh2/issues/21
-[#18]: https://github.com/vicajilau/dartssh2/issues/18
-[#17]: https://github.com/vicajilau/dartssh2/issues/17
-[#14]: https://github.com/vicajilau/dartssh2/pull/14
+[#139]: https://github.com/vicajilau/dartssh2/pull/139
+[#140]: https://github.com/vicajilau/dartssh2/pull/140
+[#141]: https://github.com/vicajilau/dartssh2/pull/141
+[#145]: https://github.com/vicajilau/dartssh2/pull/145
+[#153]: https://github.com/vicajilau/dartssh2/pull/153
+[#157]: https://github.com/vicajilau/dartssh2/pull/157
+[#162]: https://github.com/vicajilau/dartssh2/pull/162
+[#165]: https://github.com/vicajilau/dartssh2/issues/165
+[#168]: https://github.com/vicajilau/dartssh2/issues/168
+[#170]: https://github.com/vicajilau/dartssh2/pull/170
+[#171]: https://github.com/vicajilau/dartssh2/pull/171
+[#172]: https://github.com/vicajilau/dartssh2/pull/172
+[#173]: https://github.com/vicajilau/dartssh2/pull/173
 [#175]: https://github.com/vicajilau/dartssh2/pull/175
 [#176]: https://github.com/vicajilau/dartssh2/pull/176
-[#1]: https://github.com/TerminalStudio/dartssh/pull/1/files
+[#179]: https://github.com/vicajilau/dartssh2/pull/179
+[#182]: https://github.com/vicajilau/dartssh2/pull/182
+[#183]: https://github.com/vicajilau/dartssh2/issues/183
+[#186]: https://github.com/vicajilau/dartssh2/pull/186
+[#187]: https://github.com/vicajilau/dartssh2/pull/187
 [#188]: https://github.com/vicajilau/dartssh2/issues/188
 [#190]: https://github.com/vicajilau/dartssh2/issues/190
 [#193]: https://github.com/vicajilau/dartssh2/pull/193
@@ -352,19 +415,6 @@
 [#200]: https://github.com/vicajilau/dartssh2/pull/200
 [#201]: https://github.com/vicajilau/dartssh2/pull/201
 [#203]: https://github.com/vicajilau/dartssh2/pull/203
-[#115]: https://github.com/vicajilau/dartssh2/pull/115
-[#116]: https://github.com/vicajilau/dartssh2/issues/116
-[#162]: https://github.com/vicajilau/dartssh2/pull/162
-[#168]: https://github.com/vicajilau/dartssh2/issues/168
-[#170]: https://github.com/vicajilau/dartssh2/pull/170
-[#171]: https://github.com/vicajilau/dartssh2/pull/171
-[#172]: https://github.com/vicajilau/dartssh2/pull/172
-[#173]: https://github.com/vicajilau/dartssh2/pull/173
-[#179]: https://github.com/vicajilau/dartssh2/pull/179
-[#182]: https://github.com/vicajilau/dartssh2/pull/182
-[#183]: https://github.com/vicajilau/dartssh2/issues/183
-[#186]: https://github.com/vicajilau/dartssh2/pull/186
-[#187]: https://github.com/vicajilau/dartssh2/pull/187
 [#207]: https://github.com/vicajilau/dartssh2/pull/207
 [#210]: https://github.com/vicajilau/dartssh2/pull/210
 [#212]: https://github.com/vicajilau/dartssh2/pull/212
@@ -379,6 +429,20 @@
 [#223]: https://github.com/vicajilau/dartssh2/pull/223
 [#224]: https://github.com/vicajilau/dartssh2/pull/224
 [#225]: https://github.com/vicajilau/dartssh2/pull/225
+[#226]: https://github.com/vicajilau/dartssh2/issues/226
+[#229]: https://github.com/vicajilau/dartssh2/pull/229
+[#230]: https://github.com/vicajilau/dartssh2/pull/230
+[#231]: https://github.com/vicajilau/dartssh2/pull/231
+[#232]: https://github.com/vicajilau/dartssh2/pull/232
+[#233]: https://github.com/vicajilau/dartssh2/pull/233
+[#234]: https://github.com/vicajilau/dartssh2/pull/234
+[#235]: https://github.com/vicajilau/dartssh2/pull/235
+[#236]: https://github.com/vicajilau/dartssh2/pull/236
+[#237]: https://github.com/vicajilau/dartssh2/pull/237
+[#239]: https://github.com/vicajilau/dartssh2/pull/239
+[#243]: https://github.com/vicajilau/dartssh2/issues/243
+[#248]: https://github.com/vicajilau/dartssh2/pull/248
+[#244]: https://github.com/vicajilau/dartssh2/pull/244
 
 [@linhanyu]: https://github.com/linhanyu
 [@Migarl]: https://github.com/Migarl
@@ -397,3 +461,5 @@
 [@gkc]: https://github.com/gkc
 [@vicajilau]: https://github.com/vicajilau
 [@GT-610]: https://github.com/GT-610
+[@cesarcamps]: https://github.com/cesarcamps
+[@klc]: https://github.com/klc

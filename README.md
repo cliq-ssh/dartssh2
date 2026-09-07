@@ -22,7 +22,7 @@ SSH and SFTP client written in pure Dart, aiming to be feature-rich as well as e
 
 ## ✨ Features
 
--  **Pure Dart**: Working with both Dart VM and Flutter.
+-  **Pure Dart**: Runs on the Dart VM, Flutter and the web. Browser support is checked in CI against a real OpenSSH server, see [Web support](#web-support).
 -  **SSH Session**: Executing commands, spawning shells, setting environment variables, pseudo terminals, etc.
 -  **Authentication**: Supports password, in-memory private keys (`SSHKeyPair`), external asynchronous identities (`SSHIdentity` for Secure Enclave, YubiKey/FIDO2, smart cards, OS agents), RFC 4252 §7.8 public-key probing, RFC 4252 §9 hostbased authentication, and keyboard-interactive authentication.
 -  **Forwarding**: Supports local forwarding, remote forwarding, and dynamic forwarding (SOCKS5 CONNECT).
@@ -167,15 +167,34 @@ already trust end to end.
 
 ### Web support
 
-Direct native TCP sockets are not available in browsers, so this will fail on
-Flutter Web / Dart Web:
+dartssh2 runs on Flutter Web and Dart Web. The protocol, authentication,
+sessions, channel forwarding and SFTP all work compiled to JavaScript, and CI
+checks it rather than assuming it: on every pull request a browser completes a
+handshake, runs a command, holds an `aes256-gcm` session and round-trips a file
+over SFTP against a real OpenSSH server.
+
+**You have to supply the transport.** Browsers cannot open TCP sockets, so this
+fails:
 
 ```dart
 await SSHSocket.connect('host', 22);
 ```
 
-For web apps, use a custom `SSHSocket` transport over a browser-supported
-channel (for example, a WebSocket tunnel/proxy to your SSH endpoint).
+`SSHSocket` is an interface, so give it something a browser does have, normally
+a WebSocket to a proxy that bridges to your SSH endpoint. For a minimal working
+pair of both ends, see [`tool/ws_bridge.dart`](tool/ws_bridge.dart) and the
+socket in
+[`test/src/integration/web_interop_test.dart`](test/src/integration/web_interop_test.dart).
+
+Two things are not available in a browser:
+
+- `chacha20-poly1305@openssh.com`, because PointyCastle's Poly1305 needs
+  full-width 64-bit integers. It sits third in the default cipher list, so
+  AES-GCM or AES-CTR is negotiated instead and nothing needs doing. Only
+  pinning it explicitly will fail.
+- `SftpFile.downloadToRandomAccess`, which takes a `dart:io`
+  `RandomAccessFile`, and there is no local file to hand it. Use
+  `SftpFile.downloadTo`, which takes a sink, or `SftpFile.read`.
 
 ### Customize client SSH identification
 
@@ -194,6 +213,29 @@ void main() async {
 ```
 
 `ident` defaults to `DartSSH_2.0`.
+
+### Refresh the session keys
+
+`SSHClient.rekey()` starts a new key exchange on a live connection, which is
+worth doing between large transfers on a long-lived session. Channels and
+sessions keep working across it, since outgoing packets are buffered until the
+new keys are in effect.
+
+```dart
+void main() async {
+  await client.rekey(); // resolves once the new keys are in effect
+}
+```
+
+The returned future completes at `SSH_MSG_NEWKEYS`, or with the error that
+ended the connection if it dropped first, so awaiting it is enough to notice a
+failed rekey without watching `done`. If an exchange is already running, from
+either side, no second one is sent and the future tracks the one in flight.
+
+As of 4.0.0 the host key is compared against the one already accepted for the
+connection, and a server that presents a different one has the connection
+terminated with `SSHHostkeyError`, as OpenSSH does. `onVerifyHostKey` is
+consulted once per connection, not once per exchange.
 
 ### Configure handshake and authentication timeouts
 
@@ -491,6 +533,23 @@ void main() async {
 }
 ```
 
+`OpenSSHKeyPair.toPem()` writes them too. A non-empty passphrase encrypts the
+private section with `aes256-ctr` keyed by `bcrypt_pbkdf`, the same way
+`ssh-keygen` does, so the result opens with any OpenSSH tool. A null or empty
+passphrase writes the unencrypted form:
+
+```dart
+void main() async {
+  final keys = SSHKeyPair.fromPem(await File('path/to/id_ed25519').readAsString());
+  final pair = keys.first as OpenSSHKeyPair;
+
+  // Defaults to OpenSSH's 24 bcrypt rounds; pass `rounds:` to change it.
+  await File('path/to/id_ed25519.new').writeAsString(
+    pair.toPem(passphrase: '<passphrase>'),
+  );
+}
+```
+
 Decrypting encrypted PEM files (especially those using secure key derivation functions like `bcrypt` with many rounds) is a CPU-intensive operation that can freeze the UI. In Flutter, you can offload this decryption to a background isolate using the [`compute`](https://api.flutter.dev/flutter/foundation/compute-constant.html) function:
 
 ```dart
@@ -640,6 +699,10 @@ void main() async {
 ```
 
 ### File upload
+
+Uploads pipeline up to 64 outstanding write requests, matching OpenSSH. Pass
+`chunkSize` and `maxPendingRequests` to `write` to tune it, as with `download`.
+
 ```dart
 void main() async {
   final sftp = await client.sftp();
@@ -773,23 +836,33 @@ void main() async {
 ### Default preferences
 
 Each list is ordered by preference and the first algorithm the server also
-supports is the one that gets used. The defaults lead with the strongest
-option and keep the weaker ones only as a fallback for old servers:
+supports is the one that gets used. The defaults match what OpenSSH proposes
+in `myproposal.h`:
 
 | | Default order |
 |---|---|
-| **Key exchange** | curve25519 → ECDH NIST → DH group-exchange/group14 SHA-256 → the SHA-1 variants |
-| **Host key** | `ssh-ed25519` → `rsa-sha2-512/256` → ECDSA → `ssh-rsa` |
-| **Cipher** | AES-GCM → ChaCha20-Poly1305 → AES-CTR → AES-CBC |
+| **Key exchange** | curve25519 → ECDH NIST → DH group-exchange/group14 SHA-256 |
+| **Host key** | `ssh-ed25519` → `rsa-sha2-512/256` → ECDSA |
+| **Cipher** | AES-GCM → ChaCha20-Poly1305 → AES-CTR |
 | **Integrity** | ETM variants → `hmac-sha2-256/512` → `hmac-sha1` |
 
-Three groups are implemented but **left out of the defaults**, because they are
-considered broken rather than merely old. Pass them to `SSHAlgorithms`
-explicitly if a legacy server leaves you no choice:
+Everything else in the lists above is implemented but **left out of the
+defaults**. Pass it to `SSHAlgorithms` explicitly if a legacy server leaves you
+no choice:
 
-- `diffie-hellman-group1-sha1`, whose 1024-bit group is below any current recommendation.
+- `diffie-hellman-group14-sha1` and `diffie-hellman-group-exchange-sha1`, whose
+  exchange hash is SHA-1.
+- `diffie-hellman-group1-sha1`, which is SHA-1 as well and whose 1024-bit group
+  is below any current recommendation.
+- `ssh-rsa`, which signs host keys with SHA-1 and is open to chosen-prefix
+  collisions. OpenSSH disabled it by default in 8.8.
+- `aes[128|192|256]-cbc`, vulnerable to the plaintext recovery of CVE-2008-5161.
 - `hmac-md5`.
 - The truncated `hmac-sha2-[256|512]-96` variants.
+
+> Removed from the defaults in 4.0.0. A server that offers nothing but these
+> was reachable before and is not any more, so if you talk to an older router,
+> NAS or embedded device, pass the algorithm it needs.
 
 ```dart
 void main() async {

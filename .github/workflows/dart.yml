@@ -77,3 +77,72 @@ jobs:
           name: codecov-umbrella # optional
           token: ${{ secrets.CODECOV_TOKEN }} # required
           verbose: true # optional (default = false)
+
+  # README.md documents web as a supported platform, but nothing compiled the
+  # test suite to JavaScript: ByteData.getUint64/setUint64, used throughout
+  # the AEAD ciphers and SFTP, throw `UnsupportedError` under dart2js
+  # ("Uint64 accessor not supported by dart2js"), which meant every AEAD
+  # cipher and all of SFTP were dead on the web without CI ever noticing.
+  #
+  # A large chunk of the suite is VM-only (dart:io, dart:mirrors, real
+  # sockets, the local sshd integration harness) and is skipped here via
+  # `@TestOn('vm')`/`testOn: 'vm'` on those files/tests, so this job covers a
+  # deliberate subset -- chosen so the 64-bit-sensitive AEAD nonce and SFTP
+  # wire-encoding paths this exists to guard are included. The `integration`
+  # tag is excluded for the same reason as the VM job's first test step: it
+  # needs a live network/sshd.
+  test-web:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        sdk: [stable]
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.sdk }}
+
+      - name: Print Dart SDK version
+        run: dart --version
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Run unit tests compiled to JavaScript (chrome)
+        run: dart test -p chrome --exclude-tags=integration
+
+      # Everything above proves the pieces compile and behave under dart2js.
+      # None of it puts a packet on a wire, which is the gap that let every
+      # AEAD cipher and the whole of SFTP sit broken on the web until 4.0.0.
+      # The steps below run the browser against the same OpenSSH server the VM
+      # interop tests use, through a WebSocket bridge, because a browser has no
+      # TCP socket of its own. That is also what the README tells web users to
+      # write, so the test doubles as a worked example of it.
+      - name: Start a local OpenSSH server
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: tool/start_test_sshd.sh
+
+      - name: Start the WebSocket bridge
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: |
+          dart run tool/ws_bridge.dart &
+          for _ in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8022) 2>/dev/null; then
+              exec 3<&- 3>&-
+              echo "bridge is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "bridge did not come up in time" >&2
+          exit 1
+
+      - name: Run interop tests in a browser against the real server
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: dart test -p chrome --tags=integration
+
+      - name: Stop the local OpenSSH server
+        if: always()
+        run: docker rm -f dartssh2-test-sshd || true

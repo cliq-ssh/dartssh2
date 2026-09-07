@@ -1,3 +1,5 @@
+// Also uses test_utils.dart, which imports dart:io.
+@TestOn('vm')
 @Tags(['integration'])
 library;
 
@@ -81,6 +83,144 @@ void main() {
       });
     }
 
+    // The host key comparison on rekey is the one change here that can turn a
+    // connection which used to survive into one that drops, so it gets an
+    // exercise against a real server rather than a fake transport only.
+    group('rekey', () {
+      test('a rekey keeps the connection usable', () async {
+        var verifications = 0;
+        final client = SSHClient(
+          await SSHSocket.connect(localSshdHost, localSshdPort),
+          username: localSshdUser,
+          onPasswordRequest: () => localSshdPassword,
+          onVerifyHostKey: (type, fingerprint) {
+            verifications++;
+            return true;
+          },
+        );
+
+        expect(
+          String.fromCharCodes(await client.run('echo before')).trim(),
+          'before',
+        );
+        expect(verifications, 1);
+
+        // The future comes back once NEWKEYS is in effect, so a rekey that
+        // fell over shows up here rather than as a later timeout.
+        await client.rekey();
+
+        // Outgoing packets are buffered until the exchange completes, so this
+        // only comes back if the rekey went through, host key comparison and
+        // all. A mismatch would have terminated the connection instead.
+        expect(
+          String.fromCharCodes(await client.run('echo after')).trim(),
+          'after',
+        );
+
+        // The server presents the same host key, so the connection survives
+        // and onVerifyHostKey is not consulted a second time.
+        expect(verifications, 1);
+
+        await client.close();
+      });
+
+      test('an open session survives a rekey', () async {
+        final client = await getLocalClient();
+        final session = await client.shell();
+
+        await client.rekey();
+
+        session
+            .write(Uint8List.fromList('echo through-rekey\nexit\n'.codeUnits));
+        final output = String.fromCharCodes(
+          await session.stdout.expand((chunk) => chunk).toList(),
+        );
+
+        expect(output, contains('through-rekey'));
+
+        await session.done;
+        await client.close();
+      });
+
+      test('repeated rekeys are safe', () async {
+        final client = await getLocalClient();
+
+        for (var i = 0; i < 3; i++) {
+          final first = client.rekey();
+          // A second request while one is in progress does not start another
+          // exchange, it waits on the one already running. Both futures
+          // resolve off the same NEWKEYS.
+          final second = client.rekey();
+          await Future.wait([first, second]);
+          expect(await client.run('echo rekey-$i'), isNotEmpty);
+        }
+
+        await client.close();
+      });
+    });
+
+    group('session request pipelining', () {
+      // The `dartssh2-nopty` account is the one the server refuses a pty to.
+      // That is the case the flag changes: by default the exec is not sent
+      // until the pty-req has been answered, so the command never runs, while
+      // a pipelined exec is already on the wire when the refusal arrives.
+      test('the default refuses to run the command without its pty', () async {
+        final marker =
+            '/tmp/dartssh2-nopty-default-${DateTime.now().microsecondsSinceEpoch}';
+        final client = await getLocalClient(username: localSshdNoPtyUser);
+
+        await expectLater(
+          client.run('touch $marker', runInPty: true),
+          throwsA(
+            isA<SSHChannelRequestError>().having(
+              (error) => error.message,
+              'message',
+              'Failed to start pty',
+            ),
+          ),
+        );
+
+        expect(await _exists(client, marker), isFalse);
+        await client.close();
+      });
+
+      test('pipelining runs the command and reports the refused pty', () async {
+        final marker =
+            '/tmp/dartssh2-nopty-pipelined-${DateTime.now().microsecondsSinceEpoch}';
+        final client = await getLocalClient(
+          username: localSshdNoPtyUser,
+          pipelineChannelRequests: true,
+        );
+
+        final output = await client.run(
+          'touch $marker; echo ran',
+          runInPty: true,
+        );
+
+        expect(String.fromCharCodes(output).trim(), 'ran');
+        expect(await _exists(client, marker), isTrue);
+
+        await client.run('rm -f $marker');
+        await client.close();
+      });
+
+      test('pipelining runs the command despite a refused env request',
+          () async {
+        // AcceptEnv is unset on this server, so it refuses every env request.
+        // By default that throws before the command is sent.
+        final client = await getLocalClient(pipelineChannelRequests: true);
+
+        final output = await client.run(
+          'echo \$DARTSSH2_PIPELINE',
+          environment: {'DARTSSH2_PIPELINE': 'set'},
+        );
+
+        // The variable never arrived, but the command still ran.
+        expect(String.fromCharCodes(output).trim(), isEmpty);
+        await client.close();
+      });
+    });
+
     test('transfers a file over SFTP', () async {
       final client = await getLocalClient();
       final sftp = await client.sftp();
@@ -102,4 +242,10 @@ void main() {
       await client.close();
     });
   }, skip: skipWithoutLocalSshd);
+}
+
+/// Whether [path] exists on the remote side.
+Future<bool> _exists(SSHClient client, String path) async {
+  final output = await client.run('test -e $path && echo yes || echo no');
+  return String.fromCharCodes(output).trim() == 'yes';
 }
